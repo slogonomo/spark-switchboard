@@ -1,0 +1,44 @@
+# Sol-H3 Studio: a web studio for NVIDIA Research's Sol-H3-Spark video and audio pipeline on one DGX Spark, from the
+# companion repository https://github.com/slogonomo/sol-h3-studio. The pipeline runs MiniMax H3 and Lightricks
+# LTX-2.5 models; their weights are downloaded separately, under their own licenses (see that repository's README,
+# "Model terms"). Install it per its README, e.g.
+#   git clone https://github.com/slogonomo/sol-h3-studio.git ~/src/sol-h3-studio
+# This file is the same as that repository's integrations/spark-switchboard/sol-h3-studio.toml, except that it ships
+# disabled. Cloned elsewhere? Change the two "~/src/sol-h3-studio" paths in command and kill_command. Its launcher
+# (bin/sol-h3-studio) follows the launcher contract (README, "Writing a launcher") and writes the pidfile named
+# below, so a restarted switchboard re-adopts it. To open it from NVIDIA Sync while switchboard runs it, use
+# examples/launchers/delegate.sh (README, "NVIDIA Sync").
+enabled = false                          # true once sol-h3-studio is installed
+title = "Sol-H3 Studio"
+adapter = "web"
+listen = 8190                            # public port; switchboard answers here
+upstream = "http://127.0.0.1:18190"      # where the studio listens while switchboard runs it (env below)
+memory_gib = 110                         # same as the launcher's SOLH3_MIN_FREE_GIB
+max_gib = 117                            # a cap: it can grow to nearly the whole machine
+priority = 10
+idle_grace_s = 300
+idle_stop_s = 1800                       # stop after 30 min unused
+hold_s = 120
+pidfile = "~/.local/state/sol-h3-studio/launcher.pid"
+containers = ["sol-h3-qwen-*"]           # the Qwen prompt-encoder containers its pipeline starts
+passive_paths = ["/health"]
+
+[busy_probe]                             # busy while any job is queued or running
+path = "/api/state"
+list = "jobs"
+field = "status"
+idle_values = ["done", "failed"]
+
+[run]
+command = ["bash", "~/src/sol-h3-studio/bin/sol-h3-studio"]
+# SOLH3_STOP_WAIT_S: the launcher gives the server 75 s to close its pipeline (it needs ~40 s), which leaves time
+# for its own cleanup (workers, Qwen container) before switchboard's stop_timeout_s of 90 s runs out
+env = { SOLH3_PORT = "18190", SOLH3_HOST = "127.0.0.1", SOLH3_PIDFILE = "~/.local/state/sol-h3-studio/launcher.pid", SOLH3_STOP_WAIT_S = "75" }
+stop_timeout_s = 90                      # the server closes its pipeline (workers, Qwen container) in up to ~40 s
+# after a SIGKILL of the launcher's process group: kill the server, the pipeline workers (own sessions) and
+# remove the Qwen containers; the launcher reads the package path from its env file
+kill_command = ["bash", "~/src/sol-h3-studio/bin/sol-h3-studio", "--kill"]
+
+[ready]
+path = "/health"
+estimate_s = 10

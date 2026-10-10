@@ -1,0 +1,23 @@
+# ComfyUI from a local install (examples/launchers/comfyui.sh). Models load per job, so it starts in seconds; the
+# memory it needs depends on your workflows. The numbers below are from a DGX Spark running video and image workflows.
+enabled = false                          # true once COMFYUI_DIR below points at your ComfyUI checkout
+title = "ComfyUI"
+adapter = "comfyui"                      # busy = anything in its queue (GET /queue)
+listen = 8188
+upstream = "http://127.0.0.1:18188"
+memory_gib = 60                          # free memory to start (COMFY_MIN_FREE_GIB below)
+max_gib = 95                             # measured on a DGX Spark: two-stage video workflows peaked around 95 GiB
+priority = 10
+idle_grace_s = 300                       # a person looking at results between runs
+idle_stop_s = 1800                       # unused for 30 min: stopped, so a keep-warm app can come back
+hold_s = 120
+pidfile = "~/.local/state/spark-switchboard/run/comfyui.pid"
+
+[run]
+command = ["bash", "~/src/spark-switchboard/examples/launchers/comfyui.sh"]
+env = { COMFYUI_DIR = "~/ComfyUI", COMFY_PORT = "18188", COMFY_LISTEN = "127.0.0.1", COMFY_MIN_FREE_GIB = "60" }
+stop_timeout_s = 40
+
+[ready]
+path = "/system_stats"
+estimate_s = 15

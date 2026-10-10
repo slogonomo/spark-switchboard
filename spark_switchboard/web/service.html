@@ -1,0 +1,249 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+:root {
+  --bg: #f7f6f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a64; --line: #e4e2da;
+  --ok: #15803d; --wait: #b45309; --bad: #b91c1c; --idle: #57534e; --accent: #2563eb; --bar: #e9e7df;
+  --code: #efede6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141413; --panel: #1d1d1b; --ink: #e8e6df; --muted: #9c9a92; --line: #33322e;
+    --ok: #4ade80; --wait: #fbbf24; --bad: #f87171; --idle: #a8a29e; --accent: #60a5fa; --bar: #2b2a27;
+    --code: #2a2926;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #141413; --panel: #1d1d1b; --ink: #e8e6df; --muted: #9c9a92; --line: #33322e;
+  --ok: #4ade80; --wait: #fbbf24; --bad: #f87171; --idle: #a8a29e; --accent: #60a5fa; --bar: #2b2a27;
+  --code: #2a2926;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 15px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+main { max-width: 760px; margin: 0 auto; padding: 28px 16px 48px; }
+header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+h1 { font-size: 22px; margin: 0; }
+.host { color: var(--muted); font-size: 13px; }
+a { color: var(--accent); }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px 18px; margin-top: 16px; }
+.state { font-size: 20px; font-weight: 600; display: flex; align-items: center; gap: 10px; }
+.dot { width: 12px; height: 12px; border-radius: 50%; background: var(--idle); flex: none; }
+.ready .dot { background: var(--ok); } .ready { color: var(--ok); }
+.starting .dot, .waiting .dot, .stopping .dot { background: var(--wait); animation: pulse 1.2s ease-in-out infinite; }
+.starting, .waiting, .stopping { color: var(--wait); }
+.failed .dot, .no_room .dot { background: var(--bad); } .failed, .no_room { color: var(--bad); }
+.paused .dot { background: var(--wait); } .paused { color: var(--wait); }
+@keyframes pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .dot { animation: none !important; } }
+.msg { margin: 8px 0 0; }
+.detail { color: var(--muted); margin: 6px 0 0; font-size: 14px; overflow-wrap: anywhere; }
+.bar { height: 8px; background: var(--bar); border-radius: 4px; overflow: hidden; margin-top: 14px; }
+.bar > div { height: 100%; width: 0; background: var(--wait); transition: width .8s linear; }
+.timing { display: flex; justify-content: space-between; color: var(--muted); font-size: 13px; margin-top: 4px; }
+.blockers { list-style: none; padding: 0; margin: 10px 0 0; }
+.blockers li { padding: 8px 10px; border-left: 3px solid var(--wait); background: var(--bg); border-radius: 4px; margin-top: 6px; font-size: 14px; }
+.blockers li.work { border-left-color: var(--bad); }
+.blockers b { display: block; }
+.actions { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+button { font: inherit; font-size: 14px; padding: 7px 14px; border-radius: 7px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+button:disabled { opacity: .5; cursor: default; }
+.note { font-size: 13px; color: var(--muted); margin: 8px 0 0; }
+pre, code { background: var(--code); border-radius: 5px; font: 12.5px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace; }
+code { padding: 1px 5px; }
+pre { padding: 10px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere; margin: 8px 0 0; }
+details summary { cursor: pointer; color: var(--muted); font-size: 14px; }
+.others { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 16px; font-size: 13px; }
+.chip { padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); text-decoration: none; color: var(--ink); display: inline-flex; gap: 6px; align-items: center; }
+.chip .dot { width: 8px; height: 8px; animation: none; }
+.chip.ready .dot { background: var(--ok); } .chip.starting .dot, .chip.stopping .dot { background: var(--wait); }
+.chip.failed .dot { background: var(--bad); } .chip.ready, .chip.starting, .chip.stopping, .chip.failed { color: var(--ink); }
+.info { font-size: 14px; } .info p:first-child { margin-top: 0; }
+.hidden { display: none !important; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="title"></h1>
+    <span class="host"><span id="host"></span> · <a id="dash" href="#">all services</a></span>
+  </header>
+
+  <section class="panel">
+    <div id="state" class="state"><span class="dot"></span><span id="state-text">…</span></div>
+    <p id="msg" class="msg"></p>
+    <p id="detail" class="detail"></p>
+    <div id="progress" class="hidden">
+      <div class="bar"><div id="bar"></div></div>
+      <div class="timing"><span id="elapsed"></span><span id="eta"></span></div>
+    </div>
+    <div id="blocked" class="hidden">
+      <ul id="blockers" class="blockers"></ul>
+      <p id="force-note" class="note"></p>
+    </div>
+    <div id="failure" class="hidden"><pre id="failure-log"></pre></div>
+    <div class="actions">
+      <button id="btn-start" class="primary hidden">Start</button>
+      <button id="btn-resume" class="primary hidden">Resume switchboard</button>
+      <button id="btn-force" class="hidden">Switch now</button>
+      <button id="btn-cancel" class="hidden">Cancel</button>
+    </div>
+  </section>
+
+  <section id="info" class="panel info hidden"></section>
+
+  <section class="panel">
+    <details>
+      <summary>Launcher output</summary>
+      <pre id="log">(nothing yet)</pre>
+    </details>
+  </section>
+
+  <nav id="others" class="others"></nav>
+</main>
+<script>
+const SB = /*SB_CONFIG*/null;
+const $ = id => document.getElementById(id);
+const api = path => '/__switchboard/' + path;
+let last = SB.initial, posting = false, reloading = false;
+
+function ago(s) {
+  s = Math.max(0, Math.round(s));
+  if (s < 90) return s + ' s';
+  if (s < 5400) return Math.round(s / 60) + ' min';
+  return (s / 3600).toFixed(1) + ' h';
+}
+function esc(t) { const d = document.createElement('div'); d.textContent = t == null ? '' : String(t); return d.innerHTML; }
+
+async function post(action) {
+  if (posting) return;
+  posting = true;
+  try {
+    await fetch(api(action), { method: 'POST', headers: { 'X-Switchboard': '1' } });
+  } catch (e) { /* the next poll shows the state */ }
+  posting = false;
+  poll(false);
+}
+
+function phaseOf(s) {
+  if (s.state === 'ready') return ['ready', 'Ready'];
+  if (s.state === 'starting') return ['starting', 'Starting…'];
+  if (s.state === 'stopping') return ['stopping', s.want ? 'Waiting for it to stop…' : 'Stopping…'];
+  if (s.want) {
+    if (s.want.phase === 'making_room') return ['starting', 'Making room…'];
+    if (s.want.phase === 'waiting') return ['waiting', 'Waiting for memory in use'];
+    if (s.want.phase === 'no_room') return ['no_room', 'Not enough memory'];
+    return ['starting', 'Starting…'];
+  }
+  if (s.paused) return ['paused', 'Paused'];
+  if (s.state === 'failed') return ['failed', 'Failed to start'];
+  return ['stopped', 'Not running'];
+}
+
+function render(s) {
+  last = s;
+  document.title = s.title + (s.state === 'ready' ? '' : ' · ' + phaseOf(s)[1]);
+  $('title').textContent = s.title;
+  $('host').textContent = s.host + (s.listen && s.listen.length ? ':' + s.listen[0] : '');
+  $('dash').href = location.protocol + '//' + location.hostname + ':' + SB.admin_port + '/';
+  const [cls, text] = phaseOf(s);
+  $('state').className = 'state ' + cls;
+  $('state-text').textContent = text;
+
+  let msg = '';
+  if (s.state === 'ready') msg = SB.home ? 'Running. It answers requests directly.' : 'Ready. Loading the app…';
+  else msg = s.message.replace(/ Status: http\S+$/, '');
+  $('msg').textContent = msg;
+  $('detail').textContent = (s.state === 'starting' && s.detail) ? s.detail : (s.want && s.want.text && s.want.phase === 'making_room' ? s.want.text : '');
+
+  // progress: from the start request (or the start itself) towards the learned start time
+  const showBar = s.state === 'starting' || (s.want && (s.want.phase === 'making_room' || s.want.phase === 'queued'));
+  $('progress').classList.toggle('hidden', !showBar);
+  if (showBar) {
+    const t0 = s.state === 'starting' ? s.started_at : s.want.since;
+    const elapsed = Date.now() / 1000 - t0;
+    const eta = s.eta_s == null ? null : s.eta_s;
+    const total = eta == null ? null : elapsed + eta;
+    $('bar').style.width = total ? Math.min(97, 100 * elapsed / total) + '%' : '5%';
+    $('elapsed').textContent = ago(elapsed) + ' elapsed';
+    $('eta').textContent = eta == null ? '' : (eta > 2 ? 'about ' + ago(eta) + ' left' : 'almost there');
+  }
+
+  // waiting for other services: say exactly what is in the way and what "Switch now" would do
+  const blockers = (s.want && s.want.blockers) || [];
+  const waiting = s.want && (s.want.phase === 'waiting' || s.want.phase === 'no_room');
+  $('blocked').classList.toggle('hidden', !waiting || !blockers.length);
+  $('blockers').innerHTML = blockers.map(b =>
+    `<li class="${b.in_progress ? 'work' : ''}"><b>${esc(b.title)}</b>${esc(b.reason)}</li>`).join('');
+  const quietOnly = blockers.filter(b => !b.in_progress);
+  const working = blockers.filter(b => b.in_progress);
+  let note = '';
+  if (s.want && s.want.force) {
+    note = working.length ? 'Switching as soon as ' + working.map(b => b.title).join(' and ') + ' finish' + (working.length > 1 ? '' : 'es') + ' the work in progress (it is never interrupted).'
+                          : 'Switching now…';
+  } else if (quietOnly.length && working.length) {
+    note = '“Switch now” skips the quiet period for ' + quietOnly.map(b => b.title).join(', ') + '. Work in progress on ' + working.map(b => b.title).join(', ') + ' is never interrupted: the switch happens when it finishes.';
+  } else if (quietOnly.length) {
+    note = '“Switch now” stops ' + quietOnly.map(b => b.title).join(' and ') + ' now. Nothing is running on ' + (quietOnly.length > 1 ? 'them' : 'it') + ', but whoever used ' + (quietOnly.length > 1 ? 'them' : 'it') + ' last will have to wait for a reload.';
+  } else if (working.length) {
+    note = 'Work in progress is never interrupted: this starts when ' + working.map(b => b.title).join(' and ') + (working.length > 1 ? ' finish.' : ' finishes.');
+  }
+  $('force-note').textContent = note;
+  $('btn-force').classList.toggle('hidden', !(waiting && quietOnly.length && !(s.want && s.want.force)));
+
+  // failure
+  const failed = s.state === 'failed' && !s.want;
+  $('failure').classList.toggle('hidden', !failed);
+  if (failed) $('failure-log').textContent = (s.failure || '') + '\n\n' + (s.log_tail || []).join('\n');
+
+  const paused = !!s.paused && !['ready', 'starting', 'stopping'].includes(s.state);
+  $('btn-start').classList.toggle('hidden', paused || !((s.state === 'stopped' || failed) && !s.want));
+  $('btn-resume').classList.toggle('hidden', !paused);
+  $('btn-start').textContent = failed ? 'Retry' : 'Start';
+  $('btn-cancel').classList.toggle('hidden', !s.want);
+
+  $('log').textContent = (s.log_tail && s.log_tail.length) ? s.log_tail.join('\n') : '(nothing yet)';
+  $('info').classList.toggle('hidden', !s.info_html);
+  if (s.info_html && $('info').dataset.html !== s.info_html) {
+    $('info').innerHTML = s.info_html.split('{{HOST}}').join(esc(location.host));   // service files write {{HOST}} for "this host:port"
+    $('info').dataset.html = s.info_html;
+  }
+
+  $('others').innerHTML = (s.others || []).map(o => {
+    const port = o.listen && o.listen[0];
+    const href = port ? location.protocol + '//' + location.hostname + ':' + port + '/' : '#';
+    return `<a class="chip ${esc(o.state)}" href="${href}"><span class="dot"></span>${esc(o.title)} · ${esc(o.state)}</a>`;
+  }).join('');
+
+  if (s.state === 'ready' && !SB.home && !reloading) {
+    reloading = true;
+    setTimeout(() => location.reload(), 600);
+  }
+}
+
+async function poll(want = true) {
+  try {
+    const r = await fetch(api('status') + (want ? '?want=1' : ''), { cache: 'no-store' });
+    if (r.ok) render(await r.json());
+  } catch (e) {
+    $('detail').textContent = 'switchboard is not answering (restarting?)';
+  }
+}
+
+$('btn-start').onclick = () => post('start');
+$('btn-resume').onclick = async () => { await post('resume'); post('start'); };
+$('btn-cancel').onclick = () => post('cancel');
+$('btn-force').onclick = () => {
+  const s = last, blockers = ((s.want && s.want.blockers) || []).filter(b => !b.in_progress);
+  const names = blockers.map(b => '• ' + b.title + ': ' + b.reason).join('\n');
+  if (confirm('Stop these now to start ' + s.title + '?\n\n' + names + '\n\nNothing running is interrupted.')) post('start?force=1');
+};
+render(SB.initial);
+setInterval(poll, 1500);
+</script>
+</body>
+</html>

@@ -1,0 +1,5 @@
+# /etc/sudoers.d/spark-switchboard, installed by `deploy/install.sh --with-drop-caches` (optional).
+# Lets @USER@ drop the clean page cache without a password, for the GB10 page-cache quirk (README, "Memory"):
+#   echo 1 | sudo -n /usr/bin/tee /proc/sys/vm/drop_caches
+# It allows this one command with this one argument and nothing else.
+@USER@ ALL=(root) NOPASSWD: /usr/bin/tee /proc/sys/vm/drop_caches

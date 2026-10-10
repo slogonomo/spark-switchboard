@@ -1,0 +1,39 @@
+# Qwen3.8 Flash Next on TensorFold, through MiaAI-Lab's recipe (MIT; it runs TensorFold by Ash Hart and the
+# TensorFold contributors, Apache-2.0): https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold
+# Install the recipe per its README first; examples/launchers/tensorfold.sh calls its start.sh and stop.sh.
+# Kept warm: it comes back whenever its memory is free, so agents and Open WebUI find it most of the time.
+# The numbers below are from a DGX Spark running this setup (recipe 1.0.0, Zig engine, FP8 KV, vision on).
+enabled = false                          # true once the recipe is installed
+title = "Qwen3.8 TensorFold"
+adapter = "openai"
+listen = 8888                            # the recipe's default port, so clients keep their URLs
+upstream = "http://127.0.0.1:18888"      # where the launcher tells the recipe to listen while switchboard runs it
+memory_gib = 115                         # free memory to start (TF_MIN_FREE_GIB below): the engine sizes its KV pool
+                                         # from what is free at start, so more is better; the recipe itself needs ~93
+max_gib = 110                            # measured on a DGX Spark: ~66 GiB of weights plus the KV pool it grows into
+priority = 30                            # among the big apps, stopped last
+keep_warm = true
+idle_grace_s = 120                       # quiet needed after a lone call before another app may take its memory
+hold_s = 180                             # requests wait this long for it to load (measured: ~70 s with the pre-read)
+pidfile = "~/.local/state/spark-switchboard/run/tensorfold.pid"
+containers = ["qwen38-flash-next-tf"]    # the recipe's CONTAINER_NAME; its memory counts as this app's
+info_html = """
+<p><b>OpenAI-compatible API</b>: base URL <code>http://{{HOST}}/v1</code>, model <code>Qwen3.8-Flash-Next</code>,
+any API key. Text, images and video.</p>
+<p>It loads on the first request when it isn't running (about 70 s; the request waits), and comes back on its own
+when the other apps have been unused for a while. <code>/v1/models</code> answers even while it is unloaded.</p>
+"""
+
+[run]
+command = ["bash", "~/src/spark-switchboard/examples/launchers/tensorfold.sh"]
+env = { TF_RECIPE_DIR = "~/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold", TF_HOST = "127.0.0.1", TF_PORT = "18888", TF_MIN_FREE_GIB = "115" }
+stop_timeout_s = 60                      # stop.sh waits up to 30 s for the server
+kill_command = ["docker", "rm", "-f", "qwen38-flash-next-tf"]   # after a SIGKILL: remove the container
+
+[ready]
+path = "/health"
+estimate_s = 70                          # measured on a DGX Spark; switchboard learns its own from the last 5 starts
+timeout_s = 1800                         # the first start builds the image and downloads the checkpoint
+
+[options]
+models = ["Qwen3.8-Flash-Next"]          # /v1/models before it has ever been seen running (the recipe's SERVED_NAME)

@@ -1,0 +1,13 @@
+spark-switchboard
+Copyright (c) 2026 slogonomo
+
+This product is licensed under the MIT License (see LICENSE).
+
+spark-switchboard is an unofficial project. It is not affiliated with, sponsored by, or endorsed by NVIDIA
+Corporation. NVIDIA, DGX, DGX Spark, GB10 and NVIDIA Sync are trademarks of NVIDIA Corporation. Other product names
+are the trademarks of their owners and are used only to describe compatibility.
+
+The example launchers and service files in examples/ start software that is not part of this product and is not
+distributed with it (ComfyUI, Open WebUI, the TensorFold recipe by MiaAI-Lab, Sol-H3 Studio from
+https://github.com/slogonomo/sol-h3-studio). Each is under its own license, and the models those apps run (for
+example MiniMax H3 and Lightricks LTX-2.5 for Sol-H3 Studio) are under their own terms.

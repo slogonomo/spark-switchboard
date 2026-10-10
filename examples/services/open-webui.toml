@@ -1,0 +1,32 @@
+# Open WebUI in docker (examples/launchers/open-webui.sh). Small, so it fits next to any of the big apps. Its chats
+# with the LLM go through switchboard's public port (8888 here), which loads the LLM when it is needed.
+# Already running Open WebUI in a container named open-webui? The launcher replaces that container on its first start
+# (it wasn't created with this launcher's settings). Its data survives only if it lives in the volume named by
+# OWUI_DATA_VOLUME (default: open-webui), so first set OWUI_DATA_VOLUME (and OWUI_IMAGE / OWUI_OLLAMA_DIR) below to
+# what that container uses, or set OWUI_CONTAINER (and `containers` / `kill_command`) to a new name.
+enabled = false                          # true to use it
+title = "Open WebUI"
+adapter = "web"
+listen = 12000
+upstream = "http://127.0.0.1:12001"
+memory_gib = 4                           # free memory to start (OWUI_MIN_FREE_GIB below)
+max_gib = 2                              # measured on a DGX Spark: idles at ~1.5 GiB. Models loaded into a bundled
+                                         # Ollama show up in its measured usage instead.
+priority = 50                            # stopped last
+idle_grace_s = 300
+hold_s = 60
+pidfile = "~/.local/state/spark-switchboard/run/open-webui.pid"
+containers = ["open-webui"]              # OWUI_CONTAINER
+
+[run]
+command = ["bash", "~/src/spark-switchboard/examples/launchers/open-webui.sh"]
+# OWUI_OPENAI_URLS: the TensorFold service's public port, seen from inside the container. Needs switchboard to listen
+# on every interface (the default `bind`).
+env = { OWUI_PORT = "12001", OWUI_BIND = "127.0.0.1", OWUI_OPENAI_URLS = "http://host.docker.internal:8888/v1", OWUI_MIN_FREE_GIB = "4" }
+stop_timeout_s = 40
+kill_command = ["docker", "stop", "-t", "5", "open-webui"]
+
+[ready]
+path = "/health"
+estimate_s = 15
+timeout_s = 600                          # the first start pulls the image

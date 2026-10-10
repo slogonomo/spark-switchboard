@@ -1,0 +1,55 @@
+# spark-switchboard main configuration.
+#
+# Where it is read from: `-c PATH`, else $SWITCHBOARD_CONFIG, else ~/.config/spark-switchboard/switchboard.toml
+# ($XDG_CONFIG_HOME), else /etc/spark-switchboard/switchboard.toml. deploy/install.sh copies this file and
+# examples/services/ to ~/.config/spark-switchboard/ when there is no config yet.
+#
+# Each file in services/ is one app: the launcher that runs it, the public port switchboard answers on, the internal
+# port the app listens on while switchboard runs it, and how much memory it needs. Check your edits with
+#   ~/src/spark-switchboard/.venv/bin/spark-switchboard check
+# (the CLI is installed in the repo's .venv), then apply them: sudo systemctl restart spark-switchboard. A restart
+# leaves running apps running; the new process re-adopts them.
+# Every key is described in the README ("Configuration reference").
+
+# Dashboard and admin API: http://<this machine>:8800/
+admin_port = 8800
+
+# Address to listen on, for the admin port and every public port. Unset, "" or "::" = every interface, IPv4 and IPv6.
+# There is no authentication: see the README's "Security" section before exposing it beyond a trusted LAN or VPN.
+# A specific address such as "127.0.0.1" also hides the apps from docker containers (Open WebUI reaching an LLM
+# through host.docker.internal) and from the rest of the network.
+# bind = ""
+
+# The name clients use to reach this machine, used in messages to API clients and in page titles. Empty = the
+# system hostname (on a DGX Spark, spark-xxxx; clients on the LAN usually reach it as spark-xxxx.local).
+hostname = ""
+
+# Start and stop timings, the remembered /v1/models lists, launcher output and the event log.
+# state_dir = "~/.local/state/spark-switchboard"
+
+# Memory (GiB) kept free on top of each app's own memory_gib when deciding whether it fits.
+reserve_gib = 0
+
+# A start that nobody waits for any more (no held request, no open status page) is dropped after this many seconds.
+want_ttl_s = 90
+
+# The first use of an app after this many seconds unused goes to the event log (0: never).
+use_event_after_s = 900
+
+# Service files, relative to this file. Services can also be written inline as [service.NAME] tables.
+include = ["services/*.toml"]
+
+[memory]
+# "system": MemAvailable from /proc/meminfo, and per-app usage measured from nvidia-smi (GPU allocations per process)
+# plus the anonymous and shared resident memory of each app's processes and containers.
+source = "system"
+
+# GB10 page-cache quirk (optional fix). The GPU driver takes its own buffers, such as a new CUDA context, from truly
+# free pages (MemFree) and doesn't wait for the kernel to evict page cache. With the cache full (MemFree near 0), a
+# starting app can fail with NV_ERR_NO_MEMORY / CUDA_ERROR_OUT_OF_MEMORY although MemAvailable is ample; observed on a
+# DGX Spark when an LLM server started right after a video pipeline. Below free_floor_gib of MemFree, switchboard runs
+# reclaim_command before a start, which drops the clean page cache (echo 1). Writing to /proc/sys/vm/drop_caches needs
+# root: `deploy/install.sh --with-drop-caches` installs a sudoers rule that allows exactly this tee command and no
+# other. `sudo -n` never prompts; without the rule the command fails and switchboard logs a warning.
+# free_floor_gib = 20
+# reclaim_command = ["bash", "-c", "sync; echo 1 | sudo -n /usr/bin/tee /proc/sys/vm/drop_caches >/dev/null"]

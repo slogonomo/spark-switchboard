@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+:root {
+  --bg: #f7f6f2; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a64; --line: #e4e2da;
+  --ok: #15803d; --wait: #b45309; --bad: #b91c1c; --idle: #a8a29e; --accent: #2563eb; --bar: #e9e7df; --code: #efede6;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #141413; --panel: #1d1d1b; --ink: #e8e6df; --muted: #9c9a92; --line: #33322e;
+    --ok: #4ade80; --wait: #fbbf24; --bad: #f87171; --idle: #78716c; --accent: #60a5fa; --bar: #2b2a27; --code: #2a2926;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #141413; --panel: #1d1d1b; --ink: #e8e6df; --muted: #9c9a92; --line: #33322e;
+  --ok: #4ade80; --wait: #fbbf24; --bad: #f87171; --idle: #78716c; --accent: #60a5fa; --bar: #2b2a27; --code: #2a2926;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif; }
+main { max-width: 980px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 20px; margin: 0 0 4px; }
+header { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; flex-wrap: wrap; }
+.banner { margin-top: 14px; background: var(--panel); border: 1px solid var(--wait); border-left-width: 4px; border-radius: 8px; padding: 10px 14px; display: flex; gap: 12px; align-items: center; justify-content: space-between; flex-wrap: wrap; }
+.banner b { color: var(--wait); }
+button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.hidden { display: none !important; }
+.sub { color: var(--muted); margin: 0; }
+a { color: var(--accent); }
+.mem { margin-top: 16px; }
+.membar { height: 10px; background: var(--bar); border-radius: 5px; overflow: hidden; display: flex; }
+.membar > div { height: 100%; }
+.memlegend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 12.5px; margin-top: 4px; }
+.memlegend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin-top: 18px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.card h2 { font-size: 16px; margin: 0; display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.card h2 a { font-size: 13px; font-weight: 400; }
+.badge { display: inline-flex; align-items: center; gap: 6px; font-weight: 600; }
+.badge .dot { width: 10px; height: 10px; border-radius: 50%; background: var(--idle); }
+.ready .dot { background: var(--ok); } .starting .dot, .stopping .dot, .waiting .dot { background: var(--wait); }
+.failed .dot, .no_room .dot { background: var(--bad); }
+.kv { color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }
+.kv b { color: var(--ink); font-weight: 500; }
+.warn { color: var(--wait); font-size: 13px; overflow-wrap: anywhere; }
+.err { color: var(--bad); font-size: 13px; overflow-wrap: anywhere; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+button { font: inherit; font-size: 13px; padding: 5px 11px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
+button:disabled { opacity: .45; cursor: default; }
+details summary { cursor: pointer; color: var(--muted); font-size: 13px; }
+ul.uses { margin: 4px 0 0; padding-left: 18px; font-size: 12.5px; color: var(--muted); }
+.events { margin-top: 22px; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 12px 16px; }
+.events h3 { margin: 0 0 2px; font-size: 15px; }
+.evsub { font-size: 12.5px; margin-bottom: 8px; }
+.events ol { list-style: none; margin: 0; padding: 0; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; max-height: 340px; overflow-y: auto; }
+.events li { padding: 2px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+.events li.warning { color: var(--wait); } .events li.error { color: var(--bad); }
+.events time { color: var(--muted); margin-right: 8px; }
+#toast { position: fixed; left: 16px; right: 16px; bottom: 16px; max-width: 560px; margin: 0 auto; background: var(--ink); color: var(--bg); padding: 10px 14px; border-radius: 8px; font-size: 13.5px; display: none; }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1 id="h"></h1>
+    <button id="btn-pause" title="Stop every app switchboard runs and start nothing until you resume">Pause</button>
+  </header>
+  <p class="sub">Every service answers on its own port and starts when it's used. This page shows what is running and why.</p>
+  <div id="paused" class="banner hidden" role="status">
+    <span><b>Paused</b> <span id="paused-text"></span></span>
+    <button id="btn-resume" class="primary">Resume</button>
+  </div>
+  <section class="mem">
+    <div class="membar" id="membar"></div>
+    <div class="memlegend" id="memlegend"></div>
+  </section>
+  <section class="cards" id="cards"></section>
+  <section class="events"><h3>Recent events</h3><p class="sub evsub">Starts, stops and switches<span id="evuse"></span>. Each app's recent requests are under "what counted as use".</p><ol id="events"></ol></section>
+</main>
+<div id="toast"></div>
+<script>
+const SB = /*SB_CONFIG*/null;
+const $ = id => document.getElementById(id);
+const COLORS = ['#2563eb', '#9333ea', '#0d9488', '#db2777', '#ca8a04', '#4f46e5'];
+function ago(s) { s = Math.max(0, Math.round(s)); if (s < 90) return s + ' s'; if (s < 5400) return Math.round(s / 60) + ' min'; return (s / 3600).toFixed(1) + ' h'; }
+function when(t) {
+  const d = new Date(t * 1000), today = new Date(), time = d.toLocaleTimeString();
+  if (d.toDateString() === today.toDateString()) return time;
+  today.setDate(today.getDate() - 1);
+  if (d.toDateString() === today.toDateString()) return 'yesterday ' + time;
+  return d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' }) + ' ' + time;
+}
+function esc(t) { const d = document.createElement('div'); d.textContent = t == null ? '' : String(t); return d.innerHTML; }
+function toast(t) { const el = $('toast'); el.textContent = t; el.style.display = 'block'; clearTimeout(toast.t); toast.t = setTimeout(() => el.style.display = 'none', 6000); }
+
+function phase(s) {
+  if (s.state === 'ready') return ['ready', 'ready'];
+  if (s.state === 'starting') return ['starting', 'starting'];
+  if (s.state === 'stopping') return ['stopping', 'stopping'];
+  if (s.want) return [s.want.phase === 'no_room' ? 'no_room' : 'waiting', {queued: 'queued', making_room: 'making room', waiting: 'waiting', no_room: 'no memory'}[s.want.phase] || s.want.phase];
+  return [s.state, s.state];
+}
+
+async function postApi(path) {
+  try {
+    const r = await fetch(path, { method: 'POST', headers: { 'X-Switchboard': '1' } });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok || j.ok === false) toast(j.error || ('HTTP ' + r.status));
+    return j;
+  } catch (e) { toast(String(e)); return {}; }
+}
+async function act(name, action, extra = '') { await postApi(`/api/services/${name}/${action}${extra}`); poll(); }
+async function pause() {
+  if (!confirm('Pause switchboard?\n\nIt stops every app it runs and starts nothing (no keep-warm, no starts on request) until you resume. Work in progress finishes first.')) return;
+  const j = await postApi('/api/pause?reason=dashboard');
+  const busy = Object.entries(j.services || {}).filter(([n, w]) => w.startsWith('busy')).map(([n, w]) => n + ': ' + w);
+  if (busy.length) toast(busy.join('; '));
+  poll();
+}
+async function resume() { await postApi('/api/resume?reason=dashboard'); poll(); }
+
+function render(st) {
+  $('h').textContent = 'switchboard · ' + st.host;
+  const paused = st.paused;
+  $('paused').classList.toggle('hidden', !paused);
+  $('btn-pause').classList.toggle('hidden', !!paused);
+  if (paused) $('paused-text').textContent = 'for ' + ago(st.time - paused.since) + ' (' + paused.reason + '): nothing starts, and each app switchboard runs is stopped once its work is done. A restart of switchboard also resumes.';
+  const total = st.memory.total_gib || 1, avail = st.memory.available_gib || 0;
+  let used = 0, bar = '', legend = '';
+  st.services.forEach((s, i) => {
+    if (s.usage_gib > 0.2) {
+      used += s.usage_gib;
+      bar += `<div title="${esc(s.title)} ${s.usage_gib} GiB" style="width:${100 * s.usage_gib / total}%;background:${COLORS[i % COLORS.length]}"></div>`;
+      legend += `<span><i style="background:${COLORS[i % COLORS.length]}"></i>${esc(s.title)} ${s.usage_gib.toFixed(0)} GiB</span>`;
+    }
+  });
+  const other = Math.max(0, total - avail - used);
+  bar += `<div title="other" style="width:${100 * other / total}%;background:var(--idle)"></div>`;
+  legend += `<span><i style="background:var(--idle)"></i>other ${other.toFixed(0)} GiB</span><span>free ${avail.toFixed(0)} of ${total.toFixed(0)} GiB</span>`;
+  $('membar').innerHTML = bar;
+  $('memlegend').innerHTML = legend;
+
+  const now = st.time;
+  $('cards').innerHTML = st.services.map(s => {
+    const [cls, label] = phase(s);
+    const port = s.listen && s.listen[0];
+    const href = port ? `${location.protocol}//${location.hostname}:${port}/` : null;
+    const lines = [];
+    if (s.state === 'ready') {
+      lines.push(`<div class="kv">up ${ago(now - (s.ready_at || s.since))} · holds <b>${s.usage_gib} GiB</b> · ${s.inflight} in flight · ${s.websockets} open tab${s.websockets === 1 ? '' : 's'}</div>`);
+      lines.push(`<div class="kv">last used ${s.last_activity ? ago(now - s.last_activity) + ' ago' : 'not since start'} · ${s.calls_10min} use${s.calls_10min === 1 ? '' : 's'} in 10 min</div>`);
+      if (s.busy) lines.push(`<div class="warn">working: ${esc(s.busy)}</div>`);
+      else if (s.quiet) lines.push(`<div class="kv">${esc(s.quiet.replace(/^last used [^;]+; /, ''))}</div>`);
+      if (s.external) lines.push(`<div class="warn">not started by switchboard: it won't stop it</div>`);
+    } else if (s.state === 'starting') {
+      lines.push(`<div class="kv">${ago(s.elapsed_s || 0)} of ~${ago(s.start_estimate_s)} · ${esc(s.detail || '')}</div>`);
+    } else if (s.state === 'stopping') {
+      lines.push(`<div class="kv">${esc(s.stop_reason || '')}</div>`);
+    } else {
+      lines.push(`<div class="kv">needs ${s.memory_gib} GiB free · starts in ~${ago(s.start_estimate_s)}${s.keep_warm ? ' · kept warm' : ''}${s.idle_stop_s ? ' · stops after ' + ago(s.idle_stop_s) + ' unused' : ''}</div>`);
+      if (s.stop_reason) lines.push(`<div class="kv">last stop: ${esc(s.stop_reason)}</div>`);
+      if (s.warm_note) lines.push(`<div class="warn">${esc(s.warm_note)}</div>`);
+    }
+    if (s.want) {
+      lines.push(`<div class="warn">wanted (${esc(s.want.reason)}): ${esc(s.want.text || s.want.phase)}</div>`);
+      s.want.blockers.forEach(b => lines.push(`<div class="${b.in_progress ? 'err' : 'kv'}">· ${esc(b.title)}: ${esc(b.reason)}</div>`));
+    }
+    if (s.state === 'failed' && s.failure) lines.push(`<div class="err">${esc(s.failure)}</div>`);
+    Object.entries(s.port_errors || {}).forEach(([p, e]) => lines.push(`<div class="err">port ${p}: ${esc(e)}</div>`));
+    const uses = (s.recent_uses || []).slice().reverse().map(u => `<li>${ago(now - u.t)} ago · ${esc(u.what)}</li>`).join('');
+    const canStart = !['ready', 'starting', 'stopping'].includes(s.state) && !s.want && !paused;
+    const canStop = ['ready', 'starting'].includes(s.state) && !s.external;
+    return `<article class="card">
+      <h2><span>${esc(s.title)}</span>${href ? `<a href="${href}">:${port}</a>` : ''}</h2>
+      <div class="badge ${cls}"><span class="dot"></span>${esc(label)}</div>
+      ${lines.join('')}
+      ${uses ? `<details><summary>what counted as use</summary><ul class="uses">${uses}</ul></details>` : ''}
+      <div class="actions">
+        ${canStart ? `<button onclick="act('${s.name}','start')">Start</button>` : ''}
+        ${s.want ? `<button onclick="act('${s.name}','cancel')">Cancel start</button>` : ''}
+        ${canStop ? `<button onclick="if(confirm('Stop ${esc(s.title)}?'))act('${s.name}','stop')">Stop</button>` : ''}
+        <a href="/api/services/${s.name}/log" target="_blank">log</a>
+      </div>
+    </article>`;
+  }).join('');
+
+  $('events').innerHTML = st.events.slice().reverse().map(e =>
+    `<li class="${esc(e.level)}"><time>${when(e.t)}</time>${esc(e.service)}: ${esc(e.text)}</li>`).join('');
+}
+
+async function poll() {
+  try { const r = await fetch('/api/status', { cache: 'no-store' }); if (r.ok) render(await r.json()); } catch (e) {}
+}
+if (SB.use_event_after_s > 0) $('evuse').textContent = ', plus the first use after ' + ago(SB.use_event_after_s) + ' unused';
+$('btn-pause').onclick = pause;
+$('btn-resume').onclick = resume;
+render(SB.initial);
+setInterval(poll, 2000);
+</script>
+</body>
+</html>
