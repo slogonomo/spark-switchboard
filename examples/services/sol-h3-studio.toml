@@ -27,7 +27,7 @@ passive_paths = ["/health"]
 path = "/api/state"
 list = "jobs"
 field = "status"
-idle_values = ["done", "failed"]
+idle_values = ["done", "failed", "cancelled"]   # a job's final statuses ("cancelled" since sol-h3-studio 0.3)
 
 [run]
 command = ["bash", "~/src/sol-h3-studio/bin/sol-h3-studio"]

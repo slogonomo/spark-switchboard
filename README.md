@@ -405,7 +405,7 @@ nonempty = { queue_running = "running", queue_pending = "queued" }
 path = "/api/state"
 list = "jobs"
 field = "status"
-idle_values = ["done", "failed"]
+idle_values = ["done", "failed", "cancelled"]
 ```
 
 A new protocol needs an adapter only if its clients need special answers: subclass `WebAdapter`

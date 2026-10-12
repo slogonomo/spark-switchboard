@@ -124,7 +124,7 @@ class WebAdapter:
             nonempty = { queue_running = "running", queue_pending = "queued" }   # busy if any list is non-empty
           or
             path = "/api/state"
-            list = "jobs"; field = "status"; idle_values = ["done", "failed"]    # busy if any item isn't idle
+            list = "jobs"; field = "status"; idle_values = ["done", "failed", "cancelled"]    # busy if an item isn't
         """
         p = self.cfg.busy_probe
         if not p:
