@@ -16,10 +16,14 @@ runs is stopped once it isn't working.
 
 Memory: "free" is MemAvailable minus the headroom running services may still grow into (max_gib minus what each
 holds now). A service starts when free >= its memory_gib. Stopping a service frees max(max_gib, what it holds).
+With a discrete GPU (memory.py) this holds for each pool on its own: GPU memory (memory_gib, max_gib) and host RAM
+(ram_gib, ram_max_gib). A service starts when every pool has room, and stopping services makes room in the pools
+that are short.
 """
 import asyncio
 import time
 
+from .memory import amount
 from .service import FAILED, READY, STARTING, STOPPED, STOPPING, ago
 
 FITS, EVICT, BLOCKED, NO_ROOM = "fits", "evict", "blocked", "no_room"
@@ -47,8 +51,21 @@ class Want:
 
 class Plan:
     def __init__(self, kind, free, need, victims=(), blockers=(), text=""):
-        self.kind, self.free, self.need = kind, free, need
+        self.kind, self.free, self.need = kind, free, need          # free, need: {pool: GiB}
         self.victims, self.blockers, self.text = list(victims), list(blockers), text
+
+    def short(self):
+        """The pools without room for it."""
+        return [p for p in self.need if self.free[p] < self.need[p]]
+
+
+def needs(cfg, pool):
+    """(GiB of `pool` a service needs free to start, the most of it the service grows to)."""
+    return (cfg.ram_gib, cfg.ram_max_gib) if pool == "ram" else (cfg.memory_gib, cfg.max_gib)
+
+
+def fits(free, need):
+    return all(free[p] >= need[p] for p in need)
 
 
 class Scheduler:
@@ -62,6 +79,7 @@ class Scheduler:
         self._stopping = set()          # services being stopped by stop_in_background
         self._bg = set()                # their tasks (asyncio keeps only weak references)
         self._busy_at = 0.0
+        self._memory_error = None
 
     @property
     def services(self):
@@ -172,10 +190,16 @@ class Scheduler:
     async def refresh_usage(self, max_age=2.0):
         if time.monotonic() - self._usage_at < max_age:
             return
+        mem = self.hub.memory
+        await mem.refresh()
+        if mem.error != self._memory_error:
+            self._memory_error = mem.error
+            self.hub.event("switchboard", f"can't read the free memory: {mem.error}" if mem.error
+                           else "reading the free memory again", "warning" if mem.error else "info")
         running = [s for s in self.services.values() if s.state in (STARTING, READY, STOPPING) or s.pid]
-        usage = await self.hub.memory.usage(running) if running else {}
+        usage = await mem.usage(running) if running else {}
         for s in self.services.values():
-            s.usage_gib = usage.get(s.name, 0.0)
+            s.usage = usage.get(s.name, {})
         self._usage_at = time.monotonic()
 
     async def tick(self):
@@ -230,19 +254,22 @@ class Scheduler:
 
     async def plan(self, target, force=False, evict=True):
         await self.refresh_usage()
-        free = self.hub.memory.available_gib() - self.hub.cfg.reserve_gib
+        cfg = self.hub.cfg
+        free = {p: gib - (cfg.ram_reserve_gib if p == "ram" else cfg.reserve_gib)
+                for p, gib in self.hub.memory.available().items()}
         others = [s for s in self.services.values() if s is not target]
         for s in others:
             if s.state in (STARTING, READY):
-                free -= max(0.0, s.cfg.max_gib - s.usage_gib)
-        need = target.cfg.memory_gib
-        if free >= need:
+                for p in free:
+                    free[p] -= max(0.0, needs(s.cfg, p)[1] - s.usage.get(p, 0.0))
+        need = {p: needs(target.cfg, p)[0] for p in free}
+        if fits(free, need):
             return Plan(FITS, free, need)
         if not evict:
             return Plan(NO_ROOM, free, need)
 
         def frees(s):
-            return max(s.cfg.max_gib, s.usage_gib)
+            return {p: max(needs(s.cfg, p)[1], s.usage.get(p, 0.0)) for p in free}
 
         evictable, blocked = [], []     # blocked: (service, why, hard); hard = work in progress, never interrupted
         for s in others:
@@ -261,25 +288,34 @@ class Scheduler:
                 else:
                     evictable.append(s)
         evictable.sort(key=lambda s: (s.cfg.priority, max(s.last_activity, s.ready_at or 0)))
-        total, victims = free, []
+        total, victims = dict(free), []
         for s in evictable:
-            if total >= need:
+            short = [p for p in total if total[p] < need[p]]
+            if not short:
                 break
+            f = frees(s)
+            if not any(f[p] > 0 for p in short):
+                continue                # stopping it gives back nothing that is short
             victims.append(s)
-            total += frees(s)
-        if total >= need:
+            for p in total:
+                total[p] += f[p]
+        if fits(total, need):
             names = ", ".join(v.title for v in victims)
             return Plan(EVICT, free, need, victims=victims, text=f"stopping {names} to make room")
-        if total + sum(frees(s) for s, _, _ in blocked) >= need:
+        after = {p: total[p] + sum(frees(s)[p] for s, _, _ in blocked) for p in total}
+        if fits(after, need):
             names = "; ".join(f"{s.title}: {why}" for s, why, _ in blocked)
             return Plan(BLOCKED, free, need, blockers=blocked, text=f"waiting for memory in use ({names})")
         external = [s.title for s in others if s.state in (STARTING, READY) and s.external]
-        text = (f"needs {need:.0f} GiB free; {max(free, 0):.0f} GiB is free and stopping the services switchboard "
-                f"runs would bring it to {total + sum(frees(s) for s, _, _ in blocked):.0f} GiB")
+        text = "; ".join(f"needs {amount(need[p], p)} free; {max(free[p], 0):.0f} GiB is free and stopping the "
+                         f"services switchboard runs would bring it to {after[p]:.0f} GiB"
+                         for p in need if after[p] < need[p])
         if external:
             text += f" ({', '.join(external)} was not started by switchboard, so it isn't stopped)"
         else:
             text += " (something outside switchboard is holding memory)"
+        if self.hub.memory.error:
+            text += f"; {self.hub.memory.error}"
         return Plan(NO_ROOM, free, need, blockers=blocked, text=text)
 
     async def _evict(self, w, victims):
@@ -352,7 +388,8 @@ class Scheduler:
                 s.warm_note = None
                 await s.start("keep warm: memory is free")
                 return
-            note = f"kept warm: starts when {plan.need:.0f} GiB is free ({max(plan.free, 0):.0f} GiB now)"
+            note = "kept warm: starts when " + " and ".join(
+                f"{amount(plan.need[p], p)} is free ({max(plan.free[p], 0):.0f} GiB now)" for p in plan.short())
             if note.split(" (")[0] != (s.warm_note or "").split(" (")[0]:
                 self.hub.event(s.name, note)
             s.warm_note = note
