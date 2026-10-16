@@ -12,15 +12,17 @@
 #   COMFY_EXTRA_ARGS     (empty)     more main.py arguments, e.g. "--extra-model-paths-config /path/to/paths.yaml"
 #   COMFY_MIN_FREE_GIB   60          free memory (MemAvailable) needed to start
 #   COMFY_MEM_FLOOR_GIB  6           memory guard floor; 0 turns the guard off
+# (On a machine with a discrete GPU, MemAvailable is host RAM: these two are about RAM there. switchboard's
+# [memory] source = "gpu" checks the GPU's own memory.)
 # plus the LAUNCHER_* and SWITCHBOARD_* settings described in common.sh. ComfyUI's own output goes to
 # $LAUNCHER_LOG_DIR/comfyui-server.log; its last lines are copied into this launcher's output when it fails to start.
 # $LAUNCHER_RUN_DIR/comfyui-server.pid holds "<pid> <listen> <port>" of the ComfyUI a launcher started. A new launcher
 # adopts that server when it runs on the same address, and stops it first when it runs on another one (a launcher
 # from switchboard on the internal port, say, that handed over to one started from NVIDIA Sync).
 #
-# sm_121: Triton's bundled ptxas predates GB10's sm_121, so Triton kernels fail to compile with it. When the CUDA 13
-# toolkit's ptxas exists (/usr/local/cuda/bin/ptxas on DGX OS), TRITON_PTXAS_PATH points at it. Set it yourself to
-# use another one.
+# sm_121: Triton's bundled ptxas predates GB10's sm_121, so Triton kernels fail to compile with it. On a GB10
+# (nvidia-smi reports compute capability 12.1), when the CUDA 13 toolkit's ptxas exists (/usr/local/cuda/bin/ptxas on
+# DGX OS), TRITON_PTXAS_PATH points at it. Other GPUs keep Triton's own ptxas. Set it yourself to use another one.
 APP=comfyui
 # shellcheck source-path=SCRIPTDIR source=common.sh
 source "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/common.sh"
@@ -88,7 +90,8 @@ if [[ -z "$PY_PID" ]]; then
     require_port_free "$PORT"
     require_memory "${COMFY_MIN_FREE_GIB:-60}"
     say_status "starting ComfyUI on $LISTEN:$PORT (log: $SERVER_LOG)"
-    if [[ -z "${TRITON_PTXAS_PATH:-}" && -x /usr/local/cuda/bin/ptxas ]]; then
+    if [[ -z "${TRITON_PTXAS_PATH:-}" && -x /usr/local/cuda/bin/ptxas ]] &&
+        [[ "$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1)" == "12.1" ]]; then
         export TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas
     fi
     cd "$COMFYUI_DIR" || fail "cannot cd to $COMFYUI_DIR"

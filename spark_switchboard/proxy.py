@@ -58,7 +58,7 @@ class Proxy:
         if svc.adapter.home_page(request):
             if svc.state != READY:
                 self._want_from_browser(svc)
-            return pages.service_page(self.hub, svc, 200)
+            return pages.service_page(self.hub, svc, 200, request)
         if svc.state == READY:
             try:
                 return await self.forward(request, svc, kind)
@@ -83,11 +83,11 @@ class Proxy:
         sched = self.hub.scheduler
         if self.hub.paused:                 # starts nothing and holds nothing
             if kind == NAVIGATE:
-                return pages.service_page(self.hub, svc, 503)
+                return pages.service_page(self.hub, svc, 503, request)
             return svc.adapter.unavailable(request, svc, self.info(svc, kind))
         if kind == NAVIGATE:
             self._want_from_browser(svc)
-            return pages.service_page(self.hub, svc, 503)
+            return pages.service_page(self.hub, svc, 503, request)
         pending = svc.name in sched.wants or svc.state == STARTING
         recently_failed = svc.state == FAILED and time.time() - svc.since < 60
         if kind in (TAB, PASSIVE) and not pending or recently_failed and not pending:
@@ -138,9 +138,16 @@ class Proxy:
         elif svc.state == STOPPING and w is None:
             msg = f"{svc.title} on {host} is stopping ({svc.stop_reason})."
             code = "stopping"
-        elif self.hub.paused:
+        elif self.hub.paused and self.hub.cfg.remote_resume:
             msg = (f"switchboard on {host} is paused, so it doesn't start {svc.title}; resume it on the dashboard "
                    f"(http://{host}:{self.hub.cfg.admin_port}/) or with `spark-switchboard resume`.")
+            code = "paused"
+        elif self.hub.paused:
+            # Typically a workstation whose owner is using it: say why and for how long, and don't invite callers on
+            # other machines to resume it (they can't).
+            msg = (f"switchboard on {host} has been paused for {ago(time.time() - self.hub.paused_since)} "
+                   f"({self.hub.paused_reason}), so it doesn't start {svc.title}; only {host} itself can resume it. "
+                   "Try again later.")
             code = "paused"
         elif w is not None and w.phase == "making_room":
             msg = f"{svc.title} is starting on {host} ({w.text}); ready in about {ago(eta)}."
@@ -165,7 +172,8 @@ class Proxy:
             retry = 60
         else:
             retry = int(min(max(eta if eta is not None else 30, 5), 600))
-        return {"message": msg + page, "code": code, "retry_after": retry, "state": svc.state, "eta_s": eta}
+        return {"message": msg + page, "code": code, "retry_after": retry, "state": svc.state, "eta_s": eta,
+                "paused": self.hub.paused_status() if code == "paused" else None}
 
     # -- passing traffic through -------------------------------------------------------------------------------------
     def request_headers(self, request):

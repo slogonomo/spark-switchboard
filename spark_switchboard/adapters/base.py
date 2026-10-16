@@ -111,8 +111,11 @@ class WebAdapter:
         return web.Response(text=info["message"] + "\n", status=status, headers=headers)
 
     def error_body(self, request, svc, info):
+        sb = {"service": svc.name, "state": info.get("state"), "retry_after_s": info.get("retry_after")}
+        if info.get("paused"):
+            sb["paused"] = info["paused"]           # {"since", "reason", "persists", "remote_resume"}
         return {"error": {"type": "service_unavailable", "code": info.get("code"), "message": info["message"]},
-                "switchboard": {"service": svc.name, "state": info.get("state"), "retry_after_s": info.get("retry_after")}}
+                "switchboard": sb}
 
     # -- is the service working right now? ------------------------------------------------------------------
     async def busy(self, svc, session):

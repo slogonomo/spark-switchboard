@@ -1,6 +1,7 @@
-"""Config discovery, the CLI's admin API URL, the cgroup parser, the local-client check, config keys, and the shipped
-examples. No network, apart from one tiny local HTTP server for the CLI test.   Run from the repo root:
-python -m unittest -v"""
+"""Config discovery, the CLI's admin API URL, the cgroup parser, the local-client check, config keys, the shipped
+examples, and reading a discrete GPU (with a fake nvidia-smi). No network, apart from one tiny local HTTP server for
+the CLI test.   Run from the repo root: python -m unittest -v"""
+import asyncio
 import http.server
 import json
 import os
@@ -13,12 +14,13 @@ import tomllib
 import unittest
 from argparse import Namespace
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 from spark_switchboard import config as config_mod  # noqa: E402
-from spark_switchboard import pages  # noqa: E402
+from spark_switchboard import memory, pages  # noqa: E402
 from spark_switchboard.__main__ import api_url  # noqa: E402
 from spark_switchboard.app import Hub, is_local_client  # noqa: E402
 from spark_switchboard.memory import container_id  # noqa: E402
@@ -225,6 +227,24 @@ class Keys(Tmp):
                                          '[service.a.busy_probe]\npath = "/q"\nnonempty = ["queue"]\n'))
         self.assertEqual(cfg.services["a"].options["models"], ["m"])
 
+    def test_discrete_gpu_and_pause_keys(self):
+        cfg = config_mod.load(self.write("d.toml", ""))
+        self.assertEqual((cfg.pause_persists, cfg.remote_resume, cfg.ram_reserve_gib), (False, True, 0))
+        svc = '[service.a]\ntitle = "A"\nadapter = "web"\nupstream = "http://127.0.0.1:1"\ncommand = ["true"]\n'
+        gpu = '[memory]\nsource = "gpu"\ngpu = "GPU-x"\n'
+        cfg = config_mod.load(self.write("g.toml", "pause_persists = true\nremote_resume = false\nram_reserve_gib = 8\n"
+                                         + gpu + svc + "memory_gib = 20\nram_gib = 16\n"))
+        s = cfg.services["a"]
+        self.assertEqual((s.memory_gib, s.max_gib, s.ram_gib, s.ram_max_gib), (20, 20, 16, 16))
+        self.assertEqual((cfg.pause_persists, cfg.remote_resume, cfg.ram_reserve_gib), (True, False, 8))
+        for text, frag in ((svc + "ram_gib = 16\n", r"ram_gib and ram_max_gib only apply with \[memory\] source"),
+                           ("ram_reserve_gib = 4\n", "ram_reserve_gib only applies"),
+                           ("[memory]\ngpu = 0\n", r"gpu only applies with source = \"gpu\""),
+                           ('[memory]\nsource = "gpu"\ngpu = 1.5\n', "nvidia-smi index"),
+                           ('[memory]\nsource = "cuda"\n', r"\"gpu\" \(one discrete NVIDIA GPU\)")):
+            with self.assertRaisesRegex(config_mod.ConfigError, frag):
+                config_mod.load(self.write("k.toml", text))
+
     def test_run_and_ready_tables(self):
         p = self.write("r.toml", 'include = ["services/*.toml"]\n')
         self.write("services/x.toml", 'title = "X"\nadapter = "web"\nupstream = "http://127.0.0.1:5/"\n'
@@ -257,6 +277,22 @@ class Examples(unittest.TestCase):
                 self.assertEqual(s.pidfile, os.path.expanduser(f"~/.local/state/spark-switchboard/run/{s.name}.pid"))
                 self.assertIn(f"/examples/launchers/{script}", s.command[-1])
 
+    def test_workstation_example(self):
+        # examples/workstation.toml: one discrete GPU, one app, nothing kept warm, a pause that persists and is
+        # resumed on the machine itself.
+        cfg = config_mod.load(REPO / "examples" / "workstation.toml")
+        self.assertEqual((cfg.memory["source"], cfg.pause_persists, cfg.remote_resume), ("gpu", True, False))
+        self.assertEqual(list(cfg.services), ["comfyui"])
+        s = cfg.services["comfyui"]
+        self.assertFalse(s.enabled, "examples ship disabled")
+        self.assertFalse(s.keep_warm)
+        self.assertGreater(s.idle_stop_s, 0)
+        self.assertGreater(s.ram_gib, 0)
+        self.assertEqual(float(s.env["COMFY_MIN_FREE_GIB"]), s.ram_gib, "the launcher's check is about host RAM here")
+        self.assertEqual(s.pidfile, os.path.expanduser("~/.local/state/spark-switchboard/run/comfyui.pid"))
+        self.assertTrue(s.command[-1].endswith("/examples/launchers/comfyui.sh"))
+        self.assertIn("\nAPP=comfyui\n", (REPO / "examples" / "launchers" / "comfyui.sh").read_text())
+
     def test_sol_h3_studio_matches_the_companion_repo(self):
         # examples/services/sol-h3-studio.toml is the companion repo's integrations/spark-switchboard/sol-h3-studio.toml,
         # shipped disabled (header comments aside). Checked when that repo is checked out next to this one.
@@ -276,6 +312,82 @@ class Examples(unittest.TestCase):
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.count(" off :"), 4, r.stdout)
+
+
+SMI = """#!/bin/sh
+# A fake nvidia-smi: one RTX 5090, or (FAKE_SMI=gb10) a GB10, which has no memory of its own to report.
+case "$1" in
+  --query-gpu=*)
+    if [ "$FAKE_SMI" = gb10 ]; then echo "0, GPU-20f0, NVIDIA GB10, [N/A], [N/A]"
+    else echo "0, GPU-aaaa, NVIDIA GeForce RTX 5090, 32607, 20000"; fi ;;
+  --query-compute-apps=*)
+    echo "$FAKE_PID, 8192, GPU-aaaa"
+    echo "$FAKE_PID, 1024, GPU-bbbb"
+    echo "999999999, 100, GPU-aaaa" ;;
+esac
+"""
+
+
+class DiscreteGPU(Tmp):
+    def fake_smi(self, **env):
+        d = self.tmp / "bin"
+        d.mkdir(exist_ok=True)
+        (d / "nvidia-smi").write_text(SMI)
+        (d / "nvidia-smi").chmod(0o755)
+        return mock.patch.dict(os.environ, {"PATH": f"{d}:{os.environ['PATH']}", "FAKE_PID": str(os.getpid()), **env})
+
+    def test_parsing(self):
+        gpus = memory.parse_gpus("0, GPU-aaaa, NVIDIA GeForce RTX 5090, 32607, 30001\n"
+                                 "1, GPU-bbbb, NVIDIA RTX A2000, 6138, 6000\n")
+        self.assertEqual(memory.pick_gpu(gpus, 1)["name"], "NVIDIA RTX A2000")
+        self.assertEqual(memory.pick_gpu(gpus, "GPU-aaaa")["total_mib"], 32607)
+        self.assertIsNone(memory.pick_gpu(gpus, 2))
+        self.assertIsNone(memory.parse_gpus("0, GPU-20f0, NVIDIA GB10, [N/A], [N/A]\n")[0]["free_mib"])
+        apps = "11, 1000, GPU-aaaa\n12, 500, GPU-bbbb\n11, 24, GPU-aaaa\n13, [N/A], GPU-aaaa\n"
+        self.assertEqual(memory.parse_compute_apps(apps, "GPU-aaaa"), {11: 1024.0})
+        self.assertEqual(memory.parse_compute_apps("11, 1000\n12, 500\n"), {11: 1000.0, 12: 500.0})
+        self.assertEqual(memory.amount(20, "memory"), "20 GiB")
+        self.assertEqual(memory.amount(20, "gpu"), "20 GiB of GPU memory")
+
+    def test_gpu_source_reads_nvidia_smi(self):
+        with self.fake_smi():
+            mem = memory.GPUMemory({"gpu": 0})
+            asyncio.run(mem.refresh())
+            self.assertIsNone(mem.error)
+            self.assertEqual(mem.name, "NVIDIA GeForce RTX 5090")
+            self.assertAlmostEqual(mem.total()["gpu"], 32607 / 1024)
+            self.assertAlmostEqual(mem.available()["gpu"], 20000 / 1024)
+            self.assertGreater(mem.available()["ram"], 0)
+            me = SimpleNamespace(pid=os.getpid(), cfg=SimpleNamespace(name="me", containers=[]))
+            held = asyncio.run(mem.usage([me]))["me"]
+            self.assertEqual(held["gpu"], 8.0)              # only this GPU's allocations of this process tree
+            self.assertGreater(held["ram"], 0)
+        with self.fake_smi(FAKE_SMI="gb10"):
+            mem = memory.GPUMemory({})
+            asyncio.run(mem.refresh())
+            self.assertIn('use [memory] source = "system"', mem.error)
+            self.assertEqual(mem.available()["gpu"], 0)     # never read: counts as full
+        with mock.patch.dict(os.environ, {"PATH": str(self.tmp / "nothing")}):
+            mem = memory.GPUMemory({"gpu": 3})
+            asyncio.run(mem.refresh())
+            self.assertIn("nvidia-smi did not answer", mem.error)
+
+    def test_check_reads_the_gpu(self):
+        env = {k: v for k, v in os.environ.items() if not k.startswith("SWITCHBOARD")}
+        with self.fake_smi():
+            env["PATH"] = os.environ["PATH"]
+            r = subprocess.run([sys.executable, "-m", "spark_switchboard", "check", "-c",
+                                str(REPO / "examples" / "workstation.toml")], cwd=REPO, env=env,
+                               capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("memory: GPU 0 (NVIDIA GeForce RTX 5090, 31.8 GiB, 19.5 free)", r.stdout)
+            self.assertIn("pause: persists across restarts, resumed only on this machine", r.stdout)
+            self.assertIn("needs 20 GiB GPU (max 31) + 16 GiB RAM (max 40)", r.stdout)
+            r = subprocess.run([sys.executable, "-m", "spark_switchboard", "check", "-c",
+                                str(REPO / "examples" / "workstation.toml")], cwd=REPO,
+                               env={**env, "FAKE_SMI": "gb10"}, capture_output=True, text=True, timeout=30)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("no memory of its own", r.stderr)
 
 
 class Listen(Tmp):

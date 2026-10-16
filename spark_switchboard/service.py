@@ -62,7 +62,7 @@ class Service:
         self.started_at = None
         self.ready_at = None
         self.stopping_at = None
-        self.usage_gib = 0.0
+        self.usage = {}                # {memory pool: GiB} it holds, measured (memory.py)
         self.port_errors = {}
         self.warm_note = None          # why a keep_warm service isn't running yet
         saved = hub.saved(self.name)
@@ -81,6 +81,11 @@ class Service:
         self._status_detail = None
 
     # -- bookkeeping ---------------------------------------------------------------------------------------------
+    @property
+    def usage_gib(self):
+        """What it holds of the main pool: unified memory, or GPU memory with a discrete GPU."""
+        return self.usage.get(self.hub.memory.pools[0], 0.0)
+
     @property
     def log_path(self):
         return self.hub.state_dir / "logs" / f"{self.name}.log"
@@ -508,6 +513,8 @@ class Service:
     # -- reporting -----------------------------------------------------------------------------------------------
     def status(self):
         now = time.time()
+        ram = {"ram_usage_gib": round(self.usage.get("ram", 0.0), 1), "ram_gib": self.cfg.ram_gib,
+               "ram_max_gib": self.cfg.ram_max_gib} if "ram" in self.hub.memory.pools else {}
         return {
             "name": self.name, "title": self.title, "adapter": self.cfg.adapter, "state": self.state,
             "since": self.since, "detail": self.detail, "failure": self.failure, "stop_reason": self.stop_reason,
@@ -523,6 +530,7 @@ class Service:
             "elapsed_s": round(now - self.started_at, 1) if self.state == STARTING and self.started_at else None,
             "start_estimate_s": round(self.start_estimate()), "stop_estimate_s": round(self.stop_estimate()),
             "usage_gib": round(self.usage_gib, 1), "memory_gib": self.cfg.memory_gib, "max_gib": self.cfg.max_gib,
+            **ram,
             "listen": self.cfg.listen, "upstream": self.cfg.upstream, "keep_warm": self.cfg.keep_warm,
             "idle_grace_s": self.cfg.idle_grace_s, "idle_stop_s": self.cfg.idle_stop_s, "priority": self.cfg.priority,
             "port_errors": self.port_errors, "warm_note": self.warm_note if self.state in (STOPPED, FAILED) else None, "info_html": self.cfg.info_html or self.adapter.options.get("info_html", ""),

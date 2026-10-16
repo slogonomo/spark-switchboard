@@ -59,7 +59,7 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
                 pass
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def svc(self, name, kind="openai", mem=10, max_gib=None, start=0.4, extra_args=(), **kw):
+    def svc(self, name, kind="openai", mem=10, max_gib=None, start=0.4, extra_args=(), ram=None, **kw):
         up = free_port()
         pidfile = str(self.tmp / f"{name}.pid")
         d = {"title": name.upper(), "adapter": KINDS[kind], "upstream": f"http://127.0.0.1:{up}",
@@ -68,15 +68,20 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
                          "--mem", str(max_gib or mem), "--mem-dir", str(self.memdir), "--start-delay", str(start),
                          "--pidfile", pidfile, *extra_args],
              "ready_path": "/health", "start_estimate_s": start + 1, "idle_grace_s": 0, "stop_timeout_s": 10}
+        if ram:                         # host RAM, with a fake discrete GPU (start_hub(ram_total=...))
+            d.update(ram_gib=ram)
+            d["command"] += ["--ram", str(ram)]
         d.update(kw)
         return name, d
 
-    async def start_hub(self, *services, total=121, **main):
+    async def start_hub(self, *services, total=121, ram_total=None, **main):
         self.admin = free_port()
         lines = [f"admin_port = {self.admin}", 'bind = "127.0.0.1"', f'state_dir = "{self.tmp / "state"}"',
                  'hostname = "testbox"']
         lines += [f"{k} = {toml_value(v)}" for k, v in main.items()]
         lines += ["[memory]", 'source = "fake"', f"total_gib = {total}", f'dir = "{self.memdir}"']
+        if ram_total:                   # a discrete GPU: total_gib is its memory, ram_total_gib the host's RAM
+            lines.append(f"ram_total_gib = {ram_total}")
         for name, d in services:
             lines.append(f"[service.{name}]")
             lines += [f"{k} = {toml_value(v)}" for k, v in d.items()]
@@ -88,6 +93,16 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
         self.task = asyncio.create_task(self.hub.run(self.stop_event))
         await self.until(lambda: self._listening(self.admin) and all(self._listening(s.cfg.listen[0]) for s in self.hub.services.values()))
         return self.hub
+
+    async def restart_hub(self):
+        """A new switchboard on the same config and state (the services keep running and are re-adopted)."""
+        path = self.cfg.path
+        await self.stop_hub()
+        self.cfg = config_mod.load(path)
+        self.hub = Hub(self.cfg)
+        self.stop_event = asyncio.Event()
+        self.task = asyncio.create_task(self.hub.run(self.stop_event))
+        await self.until(lambda: self._listening(self.admin) and all(self._listening(s.cfg.listen[0]) for s in self.hub.services.values()))
 
     async def stop_hub(self, stop_services=False):
         await self.hub.shutdown(stop_services=stop_services)
@@ -424,6 +439,42 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(code, 503)
         self.assertIn("outside switchboard", json.loads(body)["error"]["message"])
 
+    # -- a discrete GPU: GPU memory and host RAM are planned separately ----------------------------------------------
+    async def test_discrete_gpu_plans_gpu_memory_and_ram(self):
+        # 32 GiB of GPU memory, 64 GiB of RAM. A holds 10 + 40; B needs 10 GPU (free) and 30 RAM (24 free): stopping
+        # the idle A makes room in RAM.
+        await self.start_hub(self.svc("a", mem=10, ram=40), self.svc("b", mem=10, ram=30), total=32, ram_total=64)
+        self.assertEqual((await self.chat("a"))[0], 200)
+        await self.hub.scheduler.refresh_usage(0)
+        st = self.hub.status()
+        self.assertEqual((st["memory"]["kind"], st["memory"]["total_gib"], st["memory"]["ram"]["total_gib"]),
+                         ("gpu", 32, 64))
+        a = next(s for s in st["services"] if s["name"] == "a")
+        self.assertEqual((a["usage_gib"], a["ram_usage_gib"], a["ram_gib"], a["ram_max_gib"]), (10, 40, 40, 40))
+        code, _, body = await self.chat("b")
+        self.assertEqual(code, 200, body)
+        self.assertEqual(self.s("a").state, "stopped")
+        self.assertIn("making room for B", self.s("a").stop_reason)
+        await self.s("b").stop("test")
+        # Memory held outside switchboard (the person at the desk): the answer names the memory that is short.
+        (self.memdir / "desktop.ram.gib").write_text("50")
+        code, headers, body = await self.chat("b", headers={"X-Switchboard-Wait": "1"})
+        self.assertEqual(code, 503)
+        err = json.loads(body)["error"]
+        self.assertEqual(err["code"], "no_memory")
+        self.assertIn("needs 30 GiB of RAM free; 14 GiB is free", err["message"])
+        self.assertNotIn("GPU memory", err["message"])
+        self.assertIn("outside switchboard", err["message"])
+        self.assertTrue(headers.get("Retry-After"))
+        (self.memdir / "desktop.ram.gib").unlink()
+        (self.memdir / "desktop.gib").write_text("25")
+        code, _, body = await self.chat("b", headers={"X-Switchboard-Wait": "1"})
+        self.assertEqual(code, 503)
+        self.assertIn("needs 10 GiB of GPU memory free; 7 GiB is free", json.loads(body)["error"]["message"])
+        (self.memdir / "desktop.gib").unlink()               # the desk is free again: the waiting start goes ahead
+        self.assertEqual((await self.chat("b"))[0], 200)
+        self.assertEqual(self.s("a").state, "stopped")
+
     # -- pause -----------------------------------------------------------------------------------------------------
     async def test_pause_keeps_keep_warm_down_until_resume(self):
         await self.start_hub(self.svc("main", mem=80, keep_warm=True))
@@ -474,6 +525,77 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
         # The status page's Resume button
         async with self.http.post(self.url("app", "/__switchboard/resume"), headers={"X-Switchboard": "1"}) as r:
             self.assertTrue((await r.json())["resumed"])
+        self.assertEqual((await self.chat("llm"))[0], 200)
+
+    async def test_a_pause_persists_across_restarts_only_when_asked(self):
+        await self.start_hub(self.svc("a"))
+        code, r = await self.admin_post("/api/pause")
+        self.assertFalse(r["paused"]["persists"])
+        await self.restart_hub()
+        self.assertFalse(self.hub.paused)                   # the default: a restart resumes
+        code, r = await self.admin_post("/api/pause?persist=1&reason=maintenance")
+        self.assertTrue(r["paused"]["persists"])
+        await self.restart_hub()
+        self.assertEqual((self.hub.paused_reason, self.hub.paused_persists), ("maintenance", True))
+        self.assertEqual((await self.chat("a"))[0], 503)
+        await self.admin_post("/api/pause?persist=0")        # pausing again doesn't undo the persisting pause
+        self.assertTrue(self.hub.paused_persists)
+        self.assertTrue((await self.admin_post("/api/resume"))[1]["resumed"])
+        await self.restart_hub()
+        self.assertFalse(self.hub.paused)
+        self.assertEqual((await self.chat("a"))[0], 200)
+
+    async def test_pause_persists_keeps_keep_warm_down_across_a_restart(self):
+        # pause_persists = true (a workstation): every pause is kept until resume, keep-warm apps included.
+        await self.start_hub(self.svc("main", mem=10, keep_warm=True), pause_persists=True)
+        await self.until(lambda: self.s("main").state == "ready")
+        code, r = await self.admin_post("/api/pause?reason=at%20the%20desk")
+        self.assertTrue(r["paused"]["persists"])
+        await self.until(lambda: self.s("main").state == "stopped")
+        await self.restart_hub()
+        self.assertEqual(self.hub.paused_reason, "at the desk")
+        self.assertTrue(any("still paused (at the desk" in e["text"] for e in self.hub.events))
+        await asyncio.sleep(2.5)                            # several ticks: keep-warm would have started it
+        self.assertEqual(self.s("main").state, "stopped")
+        self.assertTrue((await self.admin_post("/api/resume"))[1]["resumed"])
+        await self.until(lambda: self.s("main").state == "ready", timeout=10)
+        await self.restart_hub()                            # re-adopted, not paused
+        self.assertFalse(self.hub.paused)
+        await self.until(lambda: self.s("main").state == "ready")
+
+    async def test_only_this_machine_resumes_when_remote_resume_is_off(self):
+        await self.start_hub(self.svc("llm"), self.svc("app", kind="web"), remote_resume=False)
+        await self.admin_post("/api/pause?reason=in%20use%20at%20the%20desk")
+        code, headers, body = await self.chat("llm")
+        self.assertEqual(code, 503)
+        err = json.loads(body)["error"]
+        self.assertEqual(err["code"], "paused")
+        self.assertIn("(in use at the desk)", err["message"])
+        self.assertIn("only testbox itself can resume it. Try again later.", err["message"])
+        self.assertNotIn("spark-switchboard resume", err["message"])
+        self.assertEqual(headers["Retry-After"], "60")
+        async with self.http.get(self.url("app", "/api/ping"), headers={"Accept": "application/json"}) as r:
+            self.assertEqual(r.status, 503)
+            paused = (await r.json())["switchboard"]["paused"]
+            self.assertEqual((paused["reason"], paused["remote_resume"]), ("in use at the desk", False))
+        # A caller on another machine (every test client is on 127.0.0.1, so the check is replaced)
+        self.hub._local = lambda request: False
+        async with self.http.post(self.url("app", "/__switchboard/resume"), headers={"X-Switchboard": "1"}) as r:
+            self.assertEqual(r.status, 403)
+        code, r = await self.admin_post("/api/resume")
+        self.assertEqual(code, 403)
+        self.assertIn("remote_resume = false", r["error"])
+        code, r = await self.admin_post("/api/services/app/start")
+        self.assertEqual(code, 409)
+        self.assertIn("only testbox itself can resume it", r["error"])
+        async with self.http.get(self.url("app", "/"), headers={"Accept": "text/html"}) as r:
+            self.assertIn('"can_resume": false', await r.text())         # no Resume button
+        self.assertTrue(self.hub.paused)
+        del self.hub._local                                 # this machine itself
+        async with self.http.get(f"http://127.0.0.1:{self.admin}/") as r:
+            self.assertIn('"can_resume": true', await r.text())
+        code, r = await self.admin_post("/api/resume")
+        self.assertEqual((code, r["resumed"]), (200, True))
         self.assertEqual((await self.chat("llm"))[0], 200)
 
     async def test_pause_lets_work_finish_unless_killed(self):
@@ -530,6 +652,14 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(rc, 0, out)
         self.assertTrue(self.hub.paused)
         self.assertIn("cli stop-all", self.hub.paused_reason)
+        self.assertEqual(await cli("resume"), (0, "resumed\n"))
+        rc, out = await cli("pause", "--persist", "--reason", "at the desk")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("also across restarts and reboots", out)
+        self.assertEqual((self.hub.paused_reason, self.hub.paused_persists), ("at the desk", True))
+        rc, out = await cli("status")
+        self.assertIn("(at the desk)", out)
+        self.assertIn("persists across restarts", out)
         proc = await asyncio.create_subprocess_exec(sys.executable, "-m", "spark_switchboard", "--help", env=env,
                                                     cwd=str(Path(__file__).resolve().parents[1]),
                                                     stdout=asyncio.subprocess.PIPE)

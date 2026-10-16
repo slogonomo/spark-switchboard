@@ -202,7 +202,7 @@ function render(s) {
 
   const paused = !!s.paused && !['ready', 'starting', 'stopping'].includes(s.state);
   $('btn-start').classList.toggle('hidden', paused || !((s.state === 'stopped' || failed) && !s.want));
-  $('btn-resume').classList.toggle('hidden', !paused);
+  $('btn-resume').classList.toggle('hidden', !paused || !SB.can_resume);
   $('btn-start').textContent = failed ? 'Retry' : 'Start';
   $('btn-cancel').classList.toggle('hidden', !s.want);
 

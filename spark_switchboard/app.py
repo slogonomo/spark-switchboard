@@ -18,6 +18,7 @@ from .scheduler import Scheduler
 from .service import READY, STARTING, STOPPING, Service, ago
 
 PAUSED_HINT = "resume it on the dashboard or with `spark-switchboard resume`"
+LOCAL_RESUME_HINT = "only {host} itself can resume it (remote_resume = false); try again later"
 
 
 def is_local_client(remote, local=None):
@@ -70,9 +71,17 @@ class Hub:
         self.proxy = Proxy(self)
         self._runners = []
         self._tasks = []
-        # Paused (see pause()): start nothing, stop what runs. Kept in memory only: a restarted switchboard isn't paused.
+        # Paused (see pause()): start nothing, stop what runs. Kept in memory only, so a restarted switchboard isn't
+        # paused, unless the pause persists (pause_persists, `pause --persist`): then state.json keeps it until resume.
         self.paused_since = None
         self.paused_reason = None
+        self.paused_persists = False
+        kept = self._state.get("paused")
+        if isinstance(kept, dict) and kept.get("since"):
+            self.paused_since, self.paused_reason, self.paused_persists = kept["since"], kept.get("reason"), True
+            since = time.strftime("%F %T", time.localtime(self.paused_since))
+            self.event("switchboard", f"still paused ({self.paused_reason}, since {since}): the pause persists across "
+                                      "restarts until `spark-switchboard resume`")
 
     @property
     def paused(self):
@@ -84,6 +93,9 @@ class Hub:
 
     def save(self, name, values):
         self._state.setdefault("services", {}).setdefault(name, {}).update(values)
+        self._write_state()
+
+    def _write_state(self):
         tmp = self._state_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(self._state, indent=1))
         os.replace(tmp, self._state_path)
@@ -107,10 +119,18 @@ class Hub:
 
     # -- status ----------------------------------------------------------------------------------------------------
     def memory_status(self):
+        """The main pool as total_gib and available_gib; with a discrete GPU ("kind": "gpu") that is GPU memory, and
+        host RAM is under "ram"."""
         try:
-            return {"total_gib": round(self.memory.total_gib(), 1), "available_gib": round(self.memory.available_gib(), 1)}
+            total, available = self.memory.total(), self.memory.available()
         except OSError:
             return {}
+        main = self.memory.pools[0]
+        out = {"total_gib": round(total[main], 1), "available_gib": round(available[main], 1)}
+        if "ram" in self.memory.pools:
+            out.update(kind="gpu", gpu=getattr(self.memory, "name", None), error=self.memory.error,
+                       ram={"total_gib": round(total["ram"], 1), "available_gib": round(available["ram"], 1)})
+        return out
 
     def service_status(self, svc):
         w = self.scheduler.wants.get(svc.name)
@@ -123,7 +143,10 @@ class Hub:
                            for s in self.services.values() if s is not svc]}
 
     def paused_status(self):
-        return {"since": self.paused_since, "reason": self.paused_reason} if self.paused else None
+        if not self.paused:
+            return None
+        return {"since": self.paused_since, "reason": self.paused_reason, "persists": self.paused_persists,
+                "remote_resume": self.cfg.remote_resume}
 
     def status(self):
         return {"host": self.cfg.hostname, "time": time.time(), "memory": self.memory_status(),
@@ -132,15 +155,25 @@ class Hub:
                 "events": list(self.events)[-60:]}
 
     # -- pause -------------------------------------------------------------------------------------------------------
-    async def pause(self, reason, kill=False):
+    async def pause(self, reason, kill=False, persist=None):
         """Stop every service switchboard runs and start nothing until resume(): pending starts are dropped,
         keep-warm does nothing, and requests that would start a service are told that switchboard is paused. Work in
         progress is not interrupted (unless kill): such a service is stopped as soon as its work is done. Services
-        switchboard didn't start are left alone. Returns {service: what happens to it}."""
+        switchboard didn't start are left alone. persist (default: the config's pause_persists) keeps the pause in
+        state.json, so a restarted switchboard is still paused; a persisting pause stays so until resume().
+        Returns {service: what happens to it}."""
+        persist = self.cfg.pause_persists if persist is None else persist
         if not self.paused:
             self.paused_since = time.time()
             self.paused_reason = reason
-            self.event("switchboard", f"paused ({reason}): starting nothing, stopping the apps it runs")
+            self.event("switchboard", f"paused ({reason}): starting nothing, stopping the apps it runs"
+                       + ("; the pause persists across restarts" if persist else ""))
+        elif persist and not self.paused_persists:
+            self.event("switchboard", f"the pause now persists across restarts ({reason})")
+        if persist and not self.paused_persists:
+            self.paused_persists = True
+            self._state["paused"] = {"since": self.paused_since, "reason": self.paused_reason}
+            self._write_state()
         for svc in self.services.values():
             self.scheduler.cancel(svc, "dropped: switchboard is paused")
         result = {}
@@ -167,15 +200,32 @@ class Hub:
             return False
         took = time.time() - self.paused_since
         self.paused_since = self.paused_reason = None
+        if self.paused_persists:
+            self.paused_persists = False
+            self._state.pop("paused", None)
+            self._write_state()
         self.event("switchboard", f"resumed ({reason}) after {ago(took)} paused")
         for svc in self.services.values():
             svc.notify()
         self.scheduler.kick()
         return True
 
+    def paused_hint(self):
+        return PAUSED_HINT if self.cfg.remote_resume else LOCAL_RESUME_HINT.format(host=self.cfg.hostname)
+
     def paused_error(self):
         return web.json_response({"ok": False, "paused": True,
-                                  "error": f"switchboard is paused, so it starts nothing; {PAUSED_HINT}"}, status=409)
+                                  "error": f"switchboard is paused, so it starts nothing; {self.paused_hint()}"},
+                                 status=409)
+
+    def may_resume(self, request):
+        """Whether this client may resume a pause: anyone, unless remote_resume = false (this machine only)."""
+        return self.cfg.remote_resume or (request is not None and self._local(request))
+
+    def _resume_refused(self):
+        return web.json_response({"ok": False, "resumed": False,
+                                  "error": f"resume is only accepted on {self.cfg.hostname} itself "
+                                           "(remote_resume = false): `spark-switchboard resume` there"}, status=403)
 
     # -- control API -------------------------------------------------------------------------------------------------
     def _guard(self, request):
@@ -191,7 +241,7 @@ class Hub:
             if request.query.get("want") == "1":
                 self.scheduler.touch(svc)
             if action == "" and request.method == "GET" and "text/html" in request.headers.get("Accept", ""):
-                return pages.service_page(self, svc, 200)
+                return pages.service_page(self, svc, 200, request)
             return web.json_response(self.service_status(svc), headers={"Cache-Control": "no-store"})
         if request.method != "POST":
             raise web.HTTPMethodNotAllowed(request.method, ["POST"])
@@ -204,6 +254,8 @@ class Hub:
         if action == "cancel":
             return web.json_response({"ok": self.scheduler.cancel(svc, "cancelled on the status page")})
         if action == "resume":
+            if not self.may_resume(request):
+                return self._resume_refused()
             return web.json_response({"ok": True, "resumed": self.resume(f"status page of {svc.title}")})
         raise web.HTTPNotFound()
 
@@ -216,7 +268,7 @@ class Hub:
         r = app.router
 
         async def dashboard(request):
-            return pages.dashboard(self)
+            return pages.dashboard(self, request)
 
         async def status(request):
             return web.json_response(self.status(), headers={"Cache-Control": "no-store"})
@@ -239,11 +291,14 @@ class Hub:
         if kill and not self._local(request):
             return web.json_response({"ok": False, "error": "kill=1 is only accepted on the machine itself "
                                       "(spark-switchboard pause --kill)"}, status=403)
-        services = await self.pause(request.query.get("reason") or "dashboard", kill)
+        persist = {"1": True, "0": False}.get(request.query.get("persist", ""))       # else pause_persists
+        services = await self.pause(request.query.get("reason") or "dashboard", kill, persist)
         return web.json_response({"ok": True, "paused": self.paused_status(), "services": services})
 
     async def _api_resume(self, request):
         self._guard(request)
+        if not self.may_resume(request):
+            return self._resume_refused()
         return web.json_response({"ok": True, "resumed": self.resume(request.query.get("reason") or "dashboard")})
 
     def _svc(self, request):

@@ -10,6 +10,9 @@
 # (the CLI is installed in the repo's .venv), then apply them: sudo systemctl restart spark-switchboard. A restart
 # leaves running apps running; the new process re-adopts them.
 # Every key is described in the README ("Configuration reference").
+#
+# This file describes a DGX Spark (unified memory). For a workstation with one discrete NVIDIA GPU, start from
+# examples/workstation.toml instead.
 
 # Dashboard and admin API: http://<this machine>:8800/
 admin_port = 8800

@@ -1,10 +1,18 @@
 """How much memory is free, and how much each running service holds.
 
-On the DGX Spark (GB10) CPU and GPU share one pool, so MemAvailable is the number that matters for "does it fit".
+Two kinds of machine ([memory] source):
+
+  "system"  unified memory, as on the DGX Spark (GB10): CPU and GPU share one pool, so MemAvailable is the number
+            that matters for "does it fit". One pool, "memory": a service's memory_gib and max_gib.
+  "gpu"     one discrete NVIDIA GPU (a workstation): the GPU's own memory, from nvidia-smi, is one pool ("gpu":
+            memory_gib and max_gib), and host RAM (MemAvailable) another ("ram": ram_gib and ram_max_gib), for apps
+            that offload weights or activations to the CPU.
+
 What a service holds is measured, not taken from its config: GPU allocations per process (nvidia-smi) plus the
 anonymous and shared resident memory of every process that belongs to it (its launcher's process tree, plus the
-processes of the docker containers it names). File-backed pages (mmapped checkpoints) are left out: they are page
-cache, which MemAvailable already counts as free.
+processes of the docker containers it names). On unified memory both count against the one pool; with a discrete
+GPU the first counts against "gpu" and the second against "ram". File-backed pages (mmapped checkpoints) are left
+out: they are page cache, which MemAvailable already counts as free.
 """
 import asyncio
 import fnmatch
@@ -13,6 +21,14 @@ import re
 import time
 from collections import defaultdict
 from pathlib import Path
+
+# How a pool is named in messages: "needs 20 GiB free" on unified memory, "needs 20 GiB of GPU memory free" otherwise.
+LABELS = {"memory": "", "gpu": "GPU memory", "ram": "RAM"}
+
+
+def amount(gib, pool):
+    """'20 GiB', or '20 GiB of GPU memory' / '20 GiB of RAM' for the pools of a discrete GPU."""
+    return f"{gib:.0f} GiB" + (f" of {LABELS[pool]}" if LABELS.get(pool) else "")
 
 
 # A container's 64-hex id in /proc/<pid>/cgroup, for the cgroup layouts in use:
@@ -28,6 +44,60 @@ def container_id(cgroup_text):
     return m.group(1) if m else None
 
 
+def _number(text):
+    try:
+        return float(text)
+    except ValueError:
+        return None                     # "[N/A]" (GB10 has no memory of its own), "[Not Supported]"
+
+
+def parse_gpus(text):
+    """`nvidia-smi --query-gpu=index,uuid,name,memory.total,memory.free --format=csv,noheader,nounits` ->
+    [{"index", "uuid", "name", "total_mib", "free_mib"}]; a memory value nvidia-smi doesn't report is None."""
+    gpus = []
+    for line in text.splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        if len(parts) != 5:
+            continue
+        index, uuid, name, total, free = parts
+        gpus.append({"index": index, "uuid": uuid, "name": name,
+                     "total_mib": _number(total), "free_mib": _number(free)})
+    return gpus
+
+
+def pick_gpu(gpus, which):
+    """The GPU a config's `gpu` names: its nvidia-smi index (0) or its UUID ("GPU-..."). None if there is none."""
+    which = str(which).strip()
+    return next((g for g in gpus if which in (g["index"], g["uuid"])), None)
+
+
+def parse_compute_apps(text, uuid=None):
+    """`nvidia-smi --query-compute-apps=pid,used_memory[,gpu_uuid] --format=csv,noheader,nounits` -> {pid: MiB}, only
+    for the GPU with this uuid when one is given (and the lines carry it)."""
+    gpu = {}
+    for line in text.splitlines():
+        parts = [x.strip() for x in line.split(",")]
+        try:
+            pid, mib = int(parts[0]), float(parts[1])
+        except (ValueError, IndexError):
+            continue
+        if uuid and len(parts) > 2 and parts[2] != uuid:
+            continue
+        gpu[pid] = gpu.get(pid, 0) + mib
+    return gpu
+
+
+async def _run(*cmd, timeout=10):
+    """stdout of a short command, or None when it is missing, fails or is slow."""
+    try:
+        p = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
+                                                 stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(p.communicate(), timeout)
+    except (OSError, asyncio.TimeoutError):
+        return None
+    return out.decode(errors="replace") if p.returncode == 0 else None
+
+
 def _meminfo():
     out = {}
     with open("/proc/meminfo") as f:
@@ -38,20 +108,27 @@ def _meminfo():
 
 
 class SystemMemory:
+    """Unified memory (DGX Spark): one pool, MemAvailable."""
+    pools = ("memory",)
+    error = None                        # why the numbers can't be trusted right now (see GPUMemory), else None
+
     def __init__(self, opts):
         self._containers = {}
         self._containers_at = 0.0
         self.free_floor_gib = float(opts.get("free_floor_gib", 0))
         self.reclaim_command = opts.get("reclaim_command")
 
-    def total_gib(self):
-        return _meminfo()["MemTotal"] / 2**20
+    def total(self):
+        return {"memory": _meminfo()["MemTotal"] / 2**20}
 
-    def available_gib(self):
-        return _meminfo()["MemAvailable"] / 2**20
+    def available(self):
+        return {"memory": _meminfo()["MemAvailable"] / 2**20}
 
     def free_gib(self):
         return _meminfo()["MemFree"] / 2**20
+
+    async def refresh(self):
+        """Re-read what available() and total() don't read on every call (nothing here: /proc/meminfo is cheap)."""
 
     async def before_start(self, hub, svc):
         """GB10: the GPU driver allocates its own buffers (a new CUDA context, for one) from truly free pages and
@@ -75,7 +152,12 @@ class SystemMemory:
                                 f"{before:.0f} -> {self.free_gib():.0f} GiB)")
 
     async def usage(self, services):
-        """{service name: GiB held} for the given running services."""
+        """{service name: {pool: GiB held}} for the given running services."""
+        held = await self._held(services)
+        return {name: {"memory": ram + gpu} for name, (ram, gpu) in held.items()}
+
+    async def _held(self, services):
+        """{service name: (GiB of resident memory, GiB of GPU allocations)}."""
         gpu = await self._gpu()
         cmap = await self._container_names() if any(s.cfg.containers for s in services) else {}
         return await asyncio.to_thread(self._usage, services, gpu, cmap)
@@ -123,26 +205,13 @@ class SystemMemory:
                                 kb += int(line.split()[1])
                 except OSError:
                     pass
-            out[s.cfg.name] = kb / 2**20 + sum(gpu.get(p, 0) for p in pids) / 1024
+            out[s.cfg.name] = (kb / 2**20, sum(gpu.get(p, 0) for p in pids) / 1024)
         return out
 
     async def _gpu(self):
         """{pid: MiB} of GPU allocations; empty when nvidia-smi is missing or slow."""
-        try:
-            p = await asyncio.create_subprocess_exec(
-                "nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-            out, _ = await asyncio.wait_for(p.communicate(), 10)
-        except (OSError, asyncio.TimeoutError):
-            return {}
-        gpu = {}
-        for line in out.decode().splitlines():
-            try:
-                pid, mib = (x.strip() for x in line.split(","))
-                gpu[int(pid)] = gpu.get(int(pid), 0) + float(mib)
-            except ValueError:
-                pass
-        return gpu
+        out = await _run("nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits")
+        return parse_compute_apps(out or "")
 
     async def _container_names(self):
         """{full container id: name} from `docker ps` (with Podman, its docker-compatible CLI)."""
@@ -160,12 +229,66 @@ class SystemMemory:
         return self._containers
 
 
-class FakeMemory:
-    """For tests: a fixed total, and one file per holder in `dir` (<name>.gib holding a number).
-    A service's usage is its own file; MemAvailable is the total minus every file."""
+class GPUMemory(SystemMemory):
+    """One discrete NVIDIA GPU: its free memory (nvidia-smi, refreshed by refresh()) and host RAM (MemAvailable).
+    `gpu` is the GPU's nvidia-smi index or UUID. Until nvidia-smi has answered once, the GPU counts as full; after a
+    failure the last numbers stay, and `error` says why."""
+    pools = ("gpu", "ram")
 
     def __init__(self, opts):
-        self.total = float(opts["total_gib"])
+        super().__init__(opts)
+        self.gpu = str(opts.get("gpu", 0))
+        self.error = "GPU memory not read yet"
+        self.name = None
+        self.uuid = None
+        self._total = self._free = 0.0          # GiB, from the last good nvidia-smi
+
+    def total(self):
+        return {"gpu": self._total, "ram": _meminfo()["MemTotal"] / 2**20}
+
+    def available(self):
+        return {"gpu": self._free, "ram": _meminfo()["MemAvailable"] / 2**20}
+
+    async def refresh(self):
+        out = await _run("nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.free",
+                         "--format=csv,noheader,nounits")
+        self.error = self.read(out)
+
+    def read(self, out):
+        """Take in nvidia-smi's --query-gpu output (None: it failed). Returns the error text, or None."""
+        if out is None:
+            return "nvidia-smi did not answer (no NVIDIA driver, or it is busy)"
+        g = pick_gpu(parse_gpus(out), self.gpu)
+        if g is None:
+            return f"nvidia-smi lists no GPU {self.gpu!r} (set [memory] gpu to an index or UUID it lists)"
+        if g["total_mib"] is None or g["free_mib"] is None:
+            return (f"nvidia-smi reports no memory of its own for GPU {self.gpu} ({g['name']}); on unified memory "
+                    "(DGX Spark) use [memory] source = \"system\"")
+        self.name, self.uuid = g["name"], g["uuid"]
+        self._total, self._free = g["total_mib"] / 1024, g["free_mib"] / 1024
+        return None
+
+    async def usage(self, services):
+        held = await self._held(services)
+        return {name: {"gpu": gpu, "ram": ram} for name, (ram, gpu) in held.items()}
+
+    async def _gpu(self):
+        """{pid: MiB} of allocations on this GPU only."""
+        out = await _run("nvidia-smi", "--query-compute-apps=pid,used_memory,gpu_uuid", "--format=csv,noheader,nounits")
+        return parse_compute_apps(out or "", self.uuid)
+
+
+class FakeMemory:
+    """For tests: a fixed total, and one file per holder in `dir` (<name>.gib holding a number).
+    A service's usage is its own file; MemAvailable is the total minus every file. With ram_total_gib it stands in
+    for a discrete GPU: <name>.gib is GPU memory and <name>.ram.gib host RAM."""
+    error = None
+
+    def __init__(self, opts):
+        self.totals = {"memory": float(opts["total_gib"])}
+        if "ram_total_gib" in opts:
+            self.totals = {"gpu": float(opts["total_gib"]), "ram": float(opts["ram_total_gib"])}
+        self.pools = tuple(self.totals)
         self.dir = Path(os.path.expanduser(opts["dir"]))
         self.dir.mkdir(parents=True, exist_ok=True)
 
@@ -175,14 +298,23 @@ class FakeMemory:
         except (OSError, ValueError):
             return 0.0
 
-    def total_gib(self):
-        return self.total
+    def _files(self, pool):
+        if pool == "ram":
+            return list(self.dir.glob("*.ram.gib"))
+        return [f for f in self.dir.glob("*.gib") if not f.name.endswith(".ram.gib")]
 
-    def available_gib(self):
-        return self.total - sum(self._read(f) for f in self.dir.glob("*.gib"))
+    def total(self):
+        return dict(self.totals)
+
+    def available(self):
+        return {p: t - sum(self._read(f) for f in self._files(p)) for p, t in self.totals.items()}
+
+    async def refresh(self):
+        pass
 
     async def usage(self, services):
-        return {s.cfg.name: self._read(self.dir / f"{s.cfg.name}.gib") for s in services}
+        return {s.cfg.name: {p: self._read(self.dir / f"{s.cfg.name}{'.ram' if p == 'ram' else ''}.gib")
+                             for p in self.pools} for s in services}
 
     async def before_start(self, hub, svc):
         pass
@@ -192,6 +324,8 @@ def make(opts):
     src = opts.get("source", "system")
     if src == "system":
         return SystemMemory(opts)
+    if src == "gpu":
+        return GPUMemory(opts)
     if src == "fake":
         return FakeMemory(opts)
     raise ValueError(f"unknown memory source {src!r}")
