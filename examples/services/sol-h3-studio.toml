@@ -21,7 +21,10 @@ idle_stop_s = 1800                       # stop after 30 min unused
 hold_s = 120
 pidfile = "~/.local/state/sol-h3-studio/launcher.pid"
 containers = ["sol-h3-qwen-*"]           # the Qwen prompt-encoder containers its pipeline starts
-passive_paths = ["/health"]
+# Requests that never start a stopped studio (503 "stopped" instead): the ready probe, and the reads that scripts and
+# agents poll (sol-h3-studio docs/API.md): the state, clip records, waits and the waited download, posters.
+# /video/*, /input/* and every POST still start it.
+passive_paths = ["/health", "/api/state", "/api/jobs", "/api/jobs/*", "/poster/*"]
 
 [busy_probe]                             # busy while any job is queued or running
 path = "/api/state"
