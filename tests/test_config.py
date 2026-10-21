@@ -10,6 +10,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 import tomllib
 import unittest
 from argparse import Namespace
@@ -241,6 +242,11 @@ class Keys(Tmp):
                            ("ram_reserve_gib = 4\n", "ram_reserve_gib only applies"),
                            ("[memory]\ngpu = 0\n", r"gpu only applies with source = \"gpu\""),
                            ('[memory]\nsource = "gpu"\ngpu = 1.5\n', "nvidia-smi index"),
+                           # quoted, "false" is a string that Python takes as true: remote resume would be allowed
+                           ('remote_resume = "false"\n',
+                            r"remote_resume must be true or false \(unquoted\), not 'false'"),
+                           ('pause_persists = "no"\n', "pause_persists must be true or false"),
+                           (svc + 'keep_warm = "yes"\n', "keep_warm must be true or false"),
                            ('[memory]\nsource = "cuda"\n', r"\"gpu\" \(one discrete NVIDIA GPU\)")):
             with self.assertRaisesRegex(config_mod.ConfigError, frag):
                 config_mod.load(self.write("k.toml", text))
@@ -300,26 +306,30 @@ class Examples(unittest.TestCase):
         self.assertTrue(s.command[-1].endswith("/examples/launchers/comfyui.sh"))
         self.assertIn("\nAPP=comfyui\n", (REPO / "examples" / "launchers" / "comfyui.sh").read_text())
 
-    def test_lf_studio_matches_the_companion_repo(self):
-        # examples/services/lf-studio.toml is the companion repo's integrations/spark-switchboard/lf-studio.toml,
-        # shipped disabled (header comments aside), and the deprecated sol-h3-studio.toml its file of the same name.
-        # Checked when that repo is checked out next to this one, under its new name or its old one (sol-h3-studio,
-        # before its 0.5), for each of the two files it has.
+    def matches_the_companion_repo(self, name):
+        """examples/services/<name>.toml is the companion repo's integrations/spark-switchboard/<name>.toml, shipped
+        disabled (header comments aside). Checked when that repo is checked out next to this one, under its new name or
+        its old one (sol-h3-studio, before its 0.5), and has the file; skipped (saying so) when none has it."""
         checked = []
         for repo in ("lf-studio", "sol-h3-studio"):
-            for name in ("lf-studio", "sol-h3-studio"):
-                companion = REPO.parent / repo / "integrations" / "spark-switchboard" / f"{name}.toml"
-                if not companion.is_file():
-                    continue
-                with self.subTest(companion=str(companion)):
-                    ours = tomllib.loads((REPO / "examples" / "services" / f"{name}.toml").read_text())
-                    theirs = tomllib.loads(companion.read_text())
-                    self.assertIs(ours.pop("enabled"), False)
-                    self.assertIs(theirs.pop("enabled", True), True)
-                    self.assertEqual(ours, theirs)
-                checked.append(companion)
+            companion = REPO.parent / repo / "integrations" / "spark-switchboard" / f"{name}.toml"
+            if not companion.is_file():
+                continue
+            with self.subTest(companion=str(companion)):
+                ours = tomllib.loads((REPO / "examples" / "services" / f"{name}.toml").read_text())
+                theirs = tomllib.loads(companion.read_text())
+                self.assertIs(ours.pop("enabled"), False)
+                self.assertIs(theirs.pop("enabled", True), True)
+                self.assertEqual(ours, theirs)
+            checked.append(companion)
         if not checked:
-            self.skipTest(f"no lf-studio or sol-h3-studio checkout next to {REPO}")
+            self.skipTest(f"{name}.toml not compared: no lf-studio or sol-h3-studio checkout next to {REPO} has it")
+
+    def test_lf_studio_matches_the_companion_repo(self):
+        self.matches_the_companion_repo("lf-studio")            # LF Studio 0.5 and newer
+
+    def test_deprecated_sol_h3_studio_matches_the_companion_repo(self):
+        self.matches_the_companion_repo("sol-h3-studio")        # Sol-H3 Studio 0.4 (and LF Studio 0.5, which keeps it)
 
     def test_check_command_on_the_examples(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("SWITCHBOARD")}
@@ -329,9 +339,19 @@ class Examples(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertEqual(r.stdout.count(" off :"), 5, r.stdout)
 
+    def test_lf_studio_says_which_version_it_needs(self):
+        text = (REPO / "examples" / "services" / "lf-studio.toml").read_text()
+        self.assertIn("needs LF Studio 0.5 or newer", text)
+        self.assertIn("bin/lf-studio", " ".join(tomllib.loads(text)["run"]["command"]))
+
 
 SMI = """#!/bin/sh
-# A fake nvidia-smi: one RTX 5090, or (FAKE_SMI=gb10) a GB10, which has no memory of its own to report.
+# A fake nvidia-smi: one RTX 5090, or (FAKE_SMI=gb10) a GB10, which has no memory of its own to report. FAKE_SMI=fail
+# fails as after a driver update without a reboot, FAKE_SMI=hang never answers (its pid in $FAKE_SMI_PIDFILE).
+case "$FAKE_SMI" in
+  fail) echo "Failed to initialize NVML: Driver/library version mismatch"; echo "NVML library version: 580"; exit 18 ;;
+  hang) echo $$ > "$FAKE_SMI_PIDFILE"; exec sleep 60 ;;
+esac
 case "$1" in
   --query-gpu=*)
     if [ "$FAKE_SMI" = gb10 ]; then echo "0, GPU-20f0, NVIDIA GB10, [N/A], [N/A]"
@@ -386,7 +406,47 @@ class DiscreteGPU(Tmp):
         with mock.patch.dict(os.environ, {"PATH": str(self.tmp / "nothing")}):
             mem = memory.GPUMemory({"gpu": 3})
             asyncio.run(mem.refresh())
-            self.assertIn("nvidia-smi did not answer", mem.error)
+            self.assertEqual(mem.error, "nvidia-smi not found (not installed, or not on PATH)")
+
+    def test_nvidia_smi_failures_say_why_and_old_figures_expire(self):
+        with self.fake_smi():
+            mem = memory.GPUMemory({})
+            asyncio.run(mem.refresh())
+            self.assertAlmostEqual(mem.available()["gpu"], 20000 / 1024)
+        with self.fake_smi(FAKE_SMI="fail"):
+            asyncio.run(mem.refresh())
+            self.assertEqual(mem.error, "nvidia-smi failed (exit 18): Failed to initialize NVML: Driver/library "
+                                        "version mismatch")
+        self.assertAlmostEqual(mem.available()["gpu"], 20000 / 1024)     # one failure: the last figure stays
+        mem._read_at -= memory.GPUMemory.STALE_S + 1                   # ... for STALE_S, then the GPU counts as full
+        self.assertEqual(mem.available()["gpu"], 0)
+        self.assertAlmostEqual(mem.total()["gpu"], 32607 / 1024)
+        with self.fake_smi():
+            asyncio.run(mem.refresh())
+            self.assertIsNone(mem.error)
+            self.assertAlmostEqual(mem.available()["gpu"], 20000 / 1024)
+
+    def test_a_hanging_nvidia_smi_is_killed_and_not_run_again_at_once(self):
+        self.addCleanup(memory._timed_out.clear)
+        pidfile = self.tmp / "smi.pid"
+        with self.fake_smi(FAKE_SMI="hang", FAKE_SMI_PIDFILE=str(pidfile)):
+            mem = memory.GPUMemory({})
+
+            async def run():
+                with mock.patch.object(memory, "_run", lambda *cmd: run.orig(*cmd, timeout=0.5)):
+                    await mem.refresh()
+            run.orig = memory._run
+            asyncio.run(run())
+            self.assertEqual(mem.error, "nvidia-smi did not answer within 0.5 s")
+            pid = int(pidfile.read_text())
+            with self.assertRaises(ProcessLookupError):     # killed (and reaped), not left running
+                os.kill(pid, 0)
+            pidfile.unlink()
+            t0 = time.monotonic()
+            asyncio.run(mem.refresh())                      # within RETRY_AFTER_TIMEOUT_S: not run again
+            self.assertLess(time.monotonic() - t0, 0.5)
+            self.assertFalse(pidfile.exists())
+            self.assertEqual(mem.error, "nvidia-smi did not answer within 0.5 s")
 
     def test_check_reads_the_gpu(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("SWITCHBOARD")}
@@ -429,6 +489,22 @@ class Dashboard(Tmp):
         self.assertIn('"use_event_after_s": 600', text)
         self.assertIn("plus the first use after ' + ago(SB.use_event_after_s)", text)
         self.assertNotIn("15 min unused", text)
+
+
+class State(Tmp):
+    def test_a_damaged_state_file_is_kept_aside_and_reported(self):
+        p = self.write("s.toml", f'state_dir = "{self.tmp / "state"}"\n'
+                                 f'[memory]\nsource = "fake"\ntotal_gib = 10\ndir = "{self.tmp / "mem"}"\n')
+        self.write("state/state.json", '{"paused": {"since": 1, "reason": "x"}, "serv')     # cut off
+        hub = Hub(config_mod.load(p))
+        self.assertFalse(hub.paused)
+        self.assertTrue(any(e["level"] == "warning" and "state.json is damaged" in e["text"] for e in hub.events))
+        self.assertTrue((self.tmp / "state" / "state.json.bad").read_text().startswith('{"paused"'))
+        self.assertFalse((self.tmp / "state" / "state.json").exists())
+        hub._state["paused"] = {"since": 2, "reason": "y"}
+        hub._write_state(durable=True)
+        self.assertEqual(json.loads((self.tmp / "state" / "state.json").read_text())["paused"]["reason"], "y")
+        self.assertTrue((self.tmp / "state" / "state.json.bad").exists())         # not overwritten
 
 
 if __name__ == "__main__":

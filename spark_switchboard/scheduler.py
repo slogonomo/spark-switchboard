@@ -12,7 +12,8 @@ A request (or a person, or the API) *wants* a service. Each tick the scheduler g
 A want lapses when nobody is waiting for it any more (no held request, no open status page) for want_ttl_s.
 It goes at once when the last request held for it gives up while it waits for memory (phase waiting or no_room),
 unless a status page or a launcher polled it (?want=1) within POLL_GRACE_S: a want nobody waits for would otherwise
-start the app later for nobody, e.g. when a game on a workstation exits.
+start the app later for nobody, e.g. when a game on a workstation exits. Not when other services were stopped to make
+room for it (within want_ttl_s): that want lapses as usual, so the stops aren't for nothing.
 
 While switchboard is paused (Hub.pause) there are no wants and no keep-warm starts, and each service switchboard
 runs is stopped once it isn't working.
@@ -31,6 +32,7 @@ from .service import FAILED, READY, STARTING, STOPPED, STOPPING, ago
 
 FITS, EVICT, BLOCKED, NO_ROOM = "fits", "evict", "blocked", "no_room"
 POLL_GRACE_S = 10           # a ?want=1 poll this recent keeps a want whose held requests gave up (pages poll every 2-3 s)
+ROOM_WAIT_S = 20            # after stopping services to make room, how long to wait for their memory to come back
 
 
 class Want:
@@ -40,6 +42,7 @@ class Want:
         self.force = force
         self.created = self.touched = time.time()
         self.polled_at = 0.0           # last ?want=1 poll (status page, launcher): someone still waits for it
+        self.made_room_at = 0.0        # when services were last stopped to make room for it
         self.phase = "queued"          # queued | making_room | waiting | no_room
         self.text = ""
         self.blockers = []             # [(service, reason, in_progress)]
@@ -125,10 +128,12 @@ class Scheduler:
 
     def abandoned(self, w):
         """True when `w` should go now that a request held for it gave up: it still waits for memory, no other request
-        is held for it and no page or launcher polled it lately. Not while making room: the stops are under way and
-        dropping it then would start nothing in their place."""
+        is held for it and no page or launcher polled it lately. Not while making room, nor within want_ttl_s after
+        services were stopped for it (their memory can come back late): dropping it then would start nothing in their
+        place. Such a want lapses after want_ttl_s, as any other."""
+        now = time.time()
         return (self.wants.get(w.svc.name) is w and w.holders == 0 and w.phase in ("waiting", "no_room")
-                and time.time() - w.polled_at > POLL_GRACE_S)
+                and now - w.polled_at > POLL_GRACE_S and now - w.made_room_at > self.hub.cfg.want_ttl_s)
 
     def cancel(self, svc, why="cancelled"):
         w = self.wants.pop(svc.name, None)
@@ -318,6 +323,14 @@ class Scheduler:
             for p in total:
                 total[p] += f[p]
         if fits(total, need):
+            # Spare each victim the others make enough room without, the last chosen first: one picked for a pool that
+            # a later one freed plenty of (a GPU app's bit of RAM, when RAM is short) stays up.
+            for v in reversed(list(victims)):
+                f = frees(v)
+                if fits({p: total[p] - f[p] for p in total}, need):
+                    victims.remove(v)
+                    for p in total:
+                        total[p] -= f[p]
             names = ", ".join(v.title for v in victims)
             return Plan(EVICT, free, need, victims=victims, text=f"stopping {names} to make room")
         after = {p: total[p] + sum(frees(s)[p] for s, _, _ in blocked) for p in total}
@@ -334,7 +347,7 @@ class Scheduler:
                          for p in need if after[p] < need[p])
         if external:
             text += f" ({', '.join(external)} was not started by switchboard, so it isn't stopped)"
-        else:
+        elif not self.hub.memory.error:         # else the error below says why (e.g. the GPU can't be read)
             text += " (something outside switchboard is holding memory)"
         if self.hub.memory.error:
             text += f"; {self.hub.memory.error}"
@@ -345,7 +358,7 @@ class Scheduler:
             await asyncio.gather(*(v.stop(f"making room for {w.svc.title}") for v in victims))
             # Containers and the driver hand memory back a few seconds after the processes exit.
             t0 = time.time()
-            while time.time() - t0 < 20:
+            while time.time() - t0 < ROOM_WAIT_S:
                 self._usage_at = 0
                 plan = await self.plan(w.svc, evict=False)
                 if plan.kind == FITS:
@@ -355,6 +368,7 @@ class Scheduler:
             self.hub.event(w.svc.name, f"error while making room: {e!r}", "error")
         finally:
             w.victims = []
+            w.made_room_at = time.time()
             if w.phase == "making_room":
                 w.phase = "queued"
             self.kick()
@@ -410,8 +424,11 @@ class Scheduler:
                 s.warm_note = None
                 await s.start("keep warm: memory is free")
                 return
+            # As in the no_memory answer: the need includes the reserve, free doesn't subtract it.
+            cfg = self.hub.cfg
             note = "kept warm: starts when " + " and ".join(
-                f"{amount(plan.need[p], p)} is free ({max(plan.free[p], 0):.0f} GiB now)" for p in plan.short())
+                f"{amount(plan.need[p] + reserve(cfg, p), p)} is free ({max(plan.free[p] + reserve(cfg, p), 0):.0f} "
+                "GiB now)" for p in plan.short())
             if note.split(" (")[0] != (s.warm_note or "").split(" (")[0]:
                 self.hub.event(s.name, note)
             s.warm_note = note

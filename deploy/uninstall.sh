@@ -66,7 +66,11 @@ if [[ -x "$SB" ]] && systemctl is-active --quiet spark-switchboard; then
     if ((KEEP)); then
         say "leaving these apps running: $(running_apps)"
     else
-        if ! run "$SB" pause --no-persist --reason uninstall "${KILL[@]}" "${CFG[@]}"; then
+        PAUSE=(pause --no-persist --reason uninstall)
+        # .venv installed from an older checkout (a `git pull` without rerunning install.sh): its pause has neither
+        # flag, and never persists.
+        [[ "$("$SB" pause --help 2>/dev/null)" == *--no-persist* ]] || PAUSE=(pause)
+        if ! run "$SB" "${PAUSE[@]}" "${KILL[@]}" "${CFG[@]}"; then
             say "could not pause spark-switchboard; nothing was removed (--keep-apps removes it anyway)"
             exit 1
         fi

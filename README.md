@@ -68,8 +68,9 @@ is there, or a status page says what is happening and when it will be ready. An 
 Built for and tested on one DGX Spark (GB10). By default it assumes **unified memory**: MemAvailable is what an app
 can still get, CPU or GPU. Other GB10 machines should behave the same but are untested. On a machine with one
 discrete NVIDIA GPU, set `[memory] source = "gpu"`: GPU memory and host RAM are then planned separately
-([A workstation with one discrete GPU](#a-workstation-with-one-discrete-gpu)). That mode is tested with fake memory
-and a fake `nvidia-smi`, not yet on a real discrete GPU.
+([A workstation with one discrete GPU](#a-workstation-with-one-discrete-gpu)). That mode has run on one workstation
+with an RTX 5090 and 64 GB of RAM (in the foreground, not yet as a systemd service), and the tests cover it with fake
+memory and a fake `nvidia-smi`.
 
 - Linux with systemd. Tested on DGX OS (Ubuntu 24.04, aarch64); other distributions and x86_64 should work.
 - sudo rights, to install the systemd unit (and the optional page-cache rule). The service itself runs as you.
@@ -91,7 +92,8 @@ and a fake `nvidia-smi`, not yet on a real discrete GPU.
    ```
 
    This first run creates `.venv`, installs the package, finds no config, copies `examples/switchboard.toml` and
-   `examples/services/*.toml` to `~/.config/spark-switchboard/`, and stops.
+   `examples/services/*.toml` (except the deprecated `sol-h3-studio.toml`) to `~/.config/spark-switchboard/`, and
+   stops.
 2. Optional: [try it first](#try-it-first) without systemd or any GPU app.
 3. Edit the copied files. Each example service ships with `enabled = false`; set it to `true` for each app you have
    installed and adjust its paths.
@@ -219,8 +221,10 @@ A want that nobody waits for any more lapses after `want_ttl_s` (90 s): no held 
 one-off request can't trigger a switch an hour later. It goes at once when the last request held for it gives up
 while it waits for memory, unless a status page or a launcher polled it (`?want=1`) in the last 10 s; that answer
 says the app won't start by itself. So memory freed later (a game exiting on a workstation) doesn't start an app
-nobody waits for. A want stays while switchboard stops other apps to make room for it, and an answer given at once
-(`X-Switchboard-Wait: 0`, or a start that takes longer than the wait) leaves it alone.
+nobody waits for. A want stays while switchboard stops other apps to make room for it, and for `want_ttl_s` after
+that (their memory can come back late), so those stops aren't for nothing. An answer given at once
+(`X-Switchboard-Wait: 0`, or a start that takes longer than the wait) leaves it alone, and so does a held request
+that couldn't have started the app (an open tab's background request, a `passive_paths` probe).
 
 **Keep warm and idle stop.** A `keep_warm` app starts whenever it fits without stopping anything (and nothing else is
 wanted, starting or stopping, and switchboard isn't [paused](#dashboard-cli-and-admin-api)). An `idle_stop_s` app stops after that long unused and not busy, which lets the
@@ -282,19 +286,23 @@ switchboard also runs on a Linux machine with one NVIDIA GPU, such as a workstat
 memory) and 64 GB of RAM that someone also uses directly. What differs from a DGX Spark:
 
 - **Two memory pools.** With `[memory] source = "gpu"`, an app's `memory_gib` and `max_gib` are GPU memory, read with
-  `nvidia-smi` for the GPU that `[memory] gpu` names (its index, default `0`, or its UUID). Host RAM is a second
-  pool: `ram_gib` (free RAM it needs to start) and `ram_max_gib` (the most it grows to), for apps that offload
-  weights to the CPU. Both default to 0, which leaves RAM out of that app's plan. An app starts when both pools have
-  room; stopping idle apps makes room in whichever pool is short, and the answers name it ("needs 20 GiB of GPU
-  memory free"). `reserve_gib` is kept free in GPU memory (the desktop uses some), `ram_reserve_gib` in RAM, on top
-  of each app's need: if a launcher refuses below 25 GiB of free GPU memory and 42 GiB of free RAM, set `memory_gib
-  = 24` and `ram_gib = 34` with reserves of 1 and 8, not the launcher's numbers plus the reserves.
+  `nvidia-smi` for the GPU that `[memory] gpu` names (its index, default `0`, or its UUID). Host RAM is a second pool:
+  `ram_gib` (free RAM it needs to start) and `ram_max_gib` (the most it grows to), for apps that offload weights to
+  the CPU. Both default to 0: such an app needs only `ram_reserve_gib` of free RAM to start (after the room other
+  running apps may still grow into). An app starts when both pools have room; stopping idle apps makes room in
+  whichever pool is short, and the answers name it ("needs 20 GiB of GPU memory free"). `reserve_gib` is kept free in
+  GPU memory (the desktop uses some), `ram_reserve_gib` in RAM, on top of each app's need: if a launcher refuses below
+  25 GiB of free GPU memory and 42 GiB of free RAM, set `memory_gib = 24` and `ram_gib = 34` with reserves of 1 and 8,
+  not the launcher's numbers plus the reserves.
 - **Measured the same way, counted apart.** An app's GPU allocations (on this GPU only) count as GPU memory, the
   resident memory of its processes and containers as RAM. Free GPU memory is the GPU's own figure, so whatever else
   runs on the desktop (a game, an app started by hand) counts too.
 - **If `nvidia-smi` can't be read**, the GPU counts as full until it can (after a later failure, the last figures
-  stay), and the event log and the `no_memory` answers say why. `spark-switchboard check` reads the GPU once and fails
-  if it can't, or if the GPU reports no memory of its own (a GB10: use `source = "system"` there).
+  stay for 60 s, so one slow answer changes nothing), and the event log and the `no_memory` answers say why: not
+  found, its own error message (such as a driver/library version mismatch after a driver update), or no answer
+  within 10 s. One that doesn't answer is killed, and `nvidia-smi` isn't run again for 30 s. `spark-switchboard
+  check` reads the GPU once and fails if it can't, or if the GPU reports no memory of its own (a GB10: use
+  `source = "system"` there).
 - **Not needed:** the GB10 page-cache fix (`free_floor_gib`, `reclaim_command`, `--with-drop-caches`).
 - **One GPU per switchboard.** A second GPU would need a second switchboard with its own ports and `state_dir`
   (untested).
@@ -306,8 +314,8 @@ inline (ComfyUI through `examples/launchers/comfyui.sh`; any launcher works the 
   `idle_stop_s` stops it after 15 min unused, which gives the GPU back.
 - **`pause_persists = true`:** a pause stays across restarts and reboots until `spark-switchboard resume`.
 - **`remote_resume = false`:** only the machine itself resumes a pause (`spark-switchboard resume` on it, or the
-  dashboard opened on it). Other machines get 403 for a resume, and the answers they get while it is paused tell them
-  to try again later instead of how to resume.
+  dashboard opened on it). Other machines get 403 for a resume, the answers they get while it is paused tell them to
+  try again later instead of how to resume, and their dashboard has no Pause button (they couldn't undo it).
 
 **Install** on a Linux machine with an NVIDIA GPU:
 
@@ -549,7 +557,8 @@ didn't start are left alone. By default a pause is kept in memory only: restarti
 that **persists** (`pause_persists = true`, or `spark-switchboard pause --persist`) is kept in `state.json` and stays
 across restarts and reboots until `spark-switchboard resume`; pausing again without it doesn't undo that. With
 `remote_resume = false`, only the machine itself can resume (the CLI on it, or the dashboard opened on it); other
-machines get 403, no Resume button, and answers that say to try again later.
+machines get 403, no Resume button, and answers that say to try again later. Their dashboard shows no Pause button
+either, since they couldn't undo it; the admin API and the CLI (`--api`) still take a pause from them.
 
 **CLI** (`.venv/bin/spark-switchboard`, or `python -m spark_switchboard`):
 
@@ -624,9 +633,10 @@ otherwise), `GET /__switchboard/status[?want=1]`, `POST /__switchboard/start[?fo
 - **No authentication**, like the apps themselves. By default switchboard listens on every interface: anyone who can
   reach the machine can use the apps, open the dashboard, read launcher logs, start, stop or cancel apps that are not
   busy, and pause or resume switchboard. Only `kill=1` (interrupting work) is limited to the machine itself, and
-  resuming a pause too when `remote_resume = false`. "The machine itself" is judged by the connecting address, so
-  behind a reverse proxy on the same machine (such as `tailscale serve`) every request counts as local: reach the
-  ports directly instead.
+  resuming a pause too when `remote_resume = false`. A pause still comes from anywhere then, and only the machine
+  itself can undo it (with `pause_persists`, also after a reboot); the dashboard offers Pause only to a viewer that
+  can resume. "The machine itself" is judged by the connecting address, so behind a reverse proxy on the same machine
+  (such as `tailscale serve`) every request counts as local: reach the ports directly instead.
 - Use it on a **trusted LAN or VPN only**. Don't forward its ports to the internet. To keep it local, set
   `bind = "127.0.0.1"` and use SSH port forwarding (NVIDIA Sync does this); note that docker containers then can't
   reach the apps through `host.docker.internal`.
@@ -674,14 +684,22 @@ git clone https://github.com/slogonomo/lf-studio.git ~/src/lf-studio
 ```
 
 `examples/services/lf-studio.toml` is the same as its `integrations/spark-switchboard/lf-studio.toml`, shipped
-disabled. Open it from NVIDIA Sync with [`delegate.sh`](#nvidia-sync).
+disabled. It needs LF Studio 0.5 or newer (the launcher `bin/lf-studio`); with Sol-H3 Studio 0.4, use the deprecated
+`sol-h3-studio.toml` below. Open it from NVIDIA Sync with [`delegate.sh`](#nvidia-sync).
 
 Before its 0.5 it was called Sol-H3 Studio (repository `sol-h3-studio`, launcher `bin/sol-h3-studio`, settings
 `SOLH3_*`). `examples/services/sol-h3-studio.toml`, the service file for those names, stays for one more release and
 is marked deprecated; install.sh no longer copies it into a new config. A config that uses it keeps working while the
-studio still accepts the old names (until its 0.6). To move: copy `lf-studio.toml` into your config's `services/`,
-move the old file out, and rename the service where you use its name (`delegate.sh lf-studio`). Its public port stays
-8190.
+studio still accepts the old names (until its 0.6). To move:
+
+1. Stop the studio (`spark-switchboard stop sol-h3-studio`) and wait until `spark-switchboard status` shows it
+   stopped. One left running keeps its pid in the old pidfile, so the restarted switchboard wouldn't find it, would
+   take it for an app it didn't start, and would never stop it.
+2. Copy `lf-studio.toml` into your config's `services/`, set `enabled = true`, and move the old file out. A checkout
+   cloned before 0.5 is still at `~/src/sol-h3-studio`: point the two paths in `command` and `kill_command` at it
+   (LF Studio's `docs/INSTALL.md`, "From 0.4 to 0.5").
+3. Rename the service where you use its name (`delegate.sh lf-studio`), then restart switchboard
+   (`deploy/install.sh`, or `sudo systemctl restart spark-switchboard`). Its public port stays 8190.
 
 ## Limits
 
@@ -705,16 +723,17 @@ python3 -m venv .venv && .venv/bin/pip install -e .
 .venv/bin/python -m unittest -v
 ```
 
-63 tests, about 2.5 min, no GPU and no docker. They start real processes on random localhost ports:
+72 tests, about 3.5 min, no GPU and no docker. They start real processes on random localhost ports:
 
-- `tests/test_switchboard.py` (32): a real switchboard in front of fake services (`tests/fake_service.py`) with fake
-  memory: holding and streaming, the status page, the tab rule, switching, quiet periods and force, never
-  interrupting work, failed starts, websockets (6 MB frames), large uploads, HEAD, re-adoption across a real process
-  restart, keep-warm with idle stop, wants lapsing (and going with the last request that gave up, unless a page
-  or launcher still polls them), admin stop, busy state that clears when work ends,
-  stop-if-unused, pause (keep-warm stays down, requests start nothing, work finishes first, resume, the CLI), a pause
-  that persists across restarts, resuming only from the machine itself (`remote_resume = false`), a fake discrete GPU
-  (GPU memory and RAM planned apart, the answer naming the pool that is short, reserve included), and a launcher started outside
+- `tests/test_switchboard.py` (36): a real switchboard in front of fake services (`tests/fake_service.py`) with fake
+  memory: holding and streaming, the status page, the tab rule, switching, quiet periods and force, never interrupting
+  work, failed starts, websockets (6 MB frames), large uploads, HEAD, re-adoption across a real process restart,
+  keep-warm with idle stop (and what its note says), wants lapsing (and going with the last request that gave up,
+  unless a page or launcher still polls them, the request couldn't start the app, or other apps were stopped for it),
+  stopping only the apps needed to make room, admin stop, busy state that clears when work ends, stop-if-unused, pause
+  (keep-warm stays down, requests start nothing, work finishes first, resume, the CLI), a pause that persists across
+  restarts, resuming only from the machine itself (`remote_resume = false`), a fake discrete GPU (GPU memory and RAM
+  planned apart, the answer naming the pool that is short, reserve included), and a launcher started outside
   switchboard that is never stopped.
 - `tests/test_launcher.py` (7): switchboard running `examples/launchers/example-app.sh`: started by a request, STATUS
   lines on the status page, the pidfile, surviving a switchboard exit, re-adoption by a new switchboard, SIGTERM
@@ -722,12 +741,12 @@ python3 -m venv .venv && .venv/bin/pip install -e .
   doesn't know running standalone; `delegate.sh` closed by a signal and by its parent going away, and across a
   pause; fractional GiB values in common.sh; `comfyui.sh` (with a fake ComfyUI) handing over across ports and leaving
   a stale pid's process alone.
-- `tests/test_config.py` (24): config discovery, the CLI's admin URL, container ids from cgroup paths (systemd,
-  cgroupfs, Podman), the local-client check, config keys in every table, `bind = "::"`, the shipped examples
-  (including `examples/workstation.toml`), reading a discrete GPU through a fake `nvidia-smi` (also in `check`), and
-  (when the companion [lf-studio](https://github.com/slogonomo/lf-studio) repo is checked out next to this one,
-  under its new or old directory name) that the LF Studio example, and the deprecated Sol-H3 Studio one, match their
-  copies there.
+- `tests/test_config.py` (29): config discovery, the CLI's admin URL, container ids from cgroup paths (systemd,
+  cgroupfs, Podman), the local-client check, config keys in every table (true/false keys unquoted), `bind = "::"`, the
+  shipped examples (including `examples/workstation.toml`), reading a discrete GPU through a fake `nvidia-smi` (also
+  in `check`; its failures, a hang that is killed, figures that go stale), a damaged `state.json`, and (when the
+  companion [lf-studio](https://github.com/slogonomo/lf-studio) repo is checked out next to this one, under its new or
+  old directory name) that the LF Studio example, and the deprecated Sol-H3 Studio one, match their copies there.
 
 ## Prior art and credits
 

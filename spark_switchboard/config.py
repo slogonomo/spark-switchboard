@@ -145,6 +145,14 @@ def _table(value, where):
     return value
 
 
+def _check_bools(d, cls, origin):
+    """The keys that are bool fields of the dataclass `cls` must be true or false: TOML's "false" (quoted) is a string,
+    which Python takes as true (remote_resume = "false" would let any machine resume)."""
+    for k, f in cls.__dataclass_fields__.items():
+        if f.type is bool and k in d and not isinstance(d[k], bool):
+            raise ConfigError(f"{origin}: {k} must be true or false (unquoted), not {d[k]!r}")
+
+
 def _check_memory(m, origin):
     m = _table(m, f"{origin}: [memory]")
     if set(m) - MEMORY_KEYS:
@@ -225,6 +233,7 @@ def _service(name, d, origin):
     if d.get("kill_command"):
         d["kill_command"] = [expand(c) for c in d["kill_command"]]
     d["upstream"] = d["upstream"].rstrip("/")
+    _check_bools(d, ServiceConfig, origin)
     s = ServiceConfig(name=name, **d)
     if not s.max_gib:
         s.max_gib = s.memory_gib
@@ -244,6 +253,7 @@ def load(path):
     unknown = set(raw) - MAIN_KEYS
     if unknown:
         raise ConfigError(f"{path}: unknown keys {sorted(unknown)}")
+    _check_bools(raw, Config, path)
     cfg = Config(path=path, **raw)
     _check_memory(cfg.memory, path)
     cfg.state_dir = Path(expand(cfg.state_dir))

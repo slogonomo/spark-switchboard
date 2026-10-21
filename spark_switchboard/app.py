@@ -57,10 +57,7 @@ class Hub:
         except OSError:
             pass
         self._state_path = self.state_dir / "state.json"
-        try:
-            self._state = json.loads(self._state_path.read_text())
-        except (OSError, ValueError):
-            self._state = {}
+        self._state = self._read_state()
         self.memory = memory.make(cfg.memory)
         self.session = None
         self.services = {}
@@ -95,10 +92,48 @@ class Hub:
         self._state.setdefault("services", {}).setdefault(name, {}).update(values)
         self._write_state()
 
-    def _write_state(self):
+    def _read_state(self):
+        """state.json, or {} when there is none. One that can't be read or parsed is kept aside as state.json.bad (not
+        overwritten by the next save), and the event log says so: it may have held a pause that persists."""
+        try:
+            text = self._state_path.read_text()
+        except FileNotFoundError:
+            return {}
+        except OSError as e:
+            self.event("switchboard", f"can't read {self._state_path} ({e.strerror}): starting without the measured "
+                       "timings, use history and any pause it kept", "warning")
+            return {}
+        try:
+            state = json.loads(text)
+            if not isinstance(state, dict):
+                raise ValueError("not a JSON object")
+            return state
+        except ValueError as e:
+            bad = self._state_path.with_name(self._state_path.name + ".bad")
+            try:
+                os.replace(self._state_path, bad)
+            except OSError:
+                bad = self._state_path
+            self.event("switchboard", f"{self._state_path} is damaged ({e}), kept as {bad}: starting without the "
+                       "measured timings, use history and any pause it kept", "warning")
+            return {}
+
+    def _write_state(self, durable=False):
+        """Write state.json atomically (a new file renamed over it). durable: also flush it to disk before going on (a
+        pause that persists, and its resume), so a power cut right after can't lose it."""
         tmp = self._state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(self._state, indent=1))
+        with open(tmp, "w") as f:
+            f.write(json.dumps(self._state, indent=1))
+            if durable:
+                f.flush()
+                os.fsync(f.fileno())
         os.replace(tmp, self._state_path)
+        if durable:
+            fd = os.open(self._state_path.parent, os.O_RDONLY)
+            try:
+                os.fsync(fd)                # the rename itself
+            finally:
+                os.close(fd)
 
     def remember(self, name, key, text):
         if self.saved(name).get("remembered", {}).get(key) != text:
@@ -132,9 +167,9 @@ class Hub:
                        ram={"total_gib": round(total["ram"], 1), "available_gib": round(available["ram"], 1)})
         return out
 
-    def service_status(self, svc):
+    def service_status(self, svc, request=None):
         w = self.scheduler.wants.get(svc.name)
-        info = self.proxy.info(svc)
+        info = self.proxy.info(svc, request=request)
         return {**svc.status(), "want": w.as_dict() if w else None, "eta_s": info["eta_s"], "message": info["message"],
                 "code": info["code"], "host": self.cfg.hostname, "memory": self.memory_status(),
                 "paused": self.paused_status(),
@@ -148,10 +183,10 @@ class Hub:
         return {"since": self.paused_since, "reason": self.paused_reason, "persists": self.paused_persists,
                 "remote_resume": self.cfg.remote_resume}
 
-    def status(self):
+    def status(self, request=None):
         return {"host": self.cfg.hostname, "time": time.time(), "memory": self.memory_status(),
                 "paused": self.paused_status(),
-                "services": [self.service_status(s) for s in self.services.values()],
+                "services": [self.service_status(s, request) for s in self.services.values()],
                 "events": list(self.events)[-60:]}
 
     # -- pause -------------------------------------------------------------------------------------------------------
@@ -173,7 +208,7 @@ class Hub:
         if persist and not self.paused_persists:
             self.paused_persists = True
             self._state["paused"] = {"since": self.paused_since, "reason": self.paused_reason}
-            self._write_state()
+            self._write_state(durable=True)
         for svc in self.services.values():
             self.scheduler.cancel(svc, "dropped: switchboard is paused")
         result = {}
@@ -203,19 +238,20 @@ class Hub:
         if self.paused_persists:
             self.paused_persists = False
             self._state.pop("paused", None)
-            self._write_state()
+            self._write_state(durable=True)
         self.event("switchboard", f"resumed ({reason}) after {ago(took)} paused")
         for svc in self.services.values():
             svc.notify()
         self.scheduler.kick()
         return True
 
-    def paused_hint(self):
-        return PAUSED_HINT if self.cfg.remote_resume else LOCAL_RESUME_HINT.format(host=self.cfg.hostname)
+    def paused_hint(self, request=None):
+        """How to end a pause, for the client of `request`: how to resume it if it may, else who can."""
+        return PAUSED_HINT if self.may_resume(request) else LOCAL_RESUME_HINT.format(host=self.cfg.hostname)
 
-    def paused_error(self):
+    def paused_error(self, request=None):
         return web.json_response({"ok": False, "paused": True,
-                                  "error": f"switchboard is paused, so it starts nothing; {self.paused_hint()}"},
+                                  "error": f"switchboard is paused, so it starts nothing; {self.paused_hint(request)}"},
                                  status=409)
 
     def may_resume(self, request):
@@ -242,12 +278,12 @@ class Hub:
                 self.scheduler.touch(svc, poll=True)
             if action == "" and request.method == "GET" and "text/html" in request.headers.get("Accept", ""):
                 return pages.service_page(self, svc, 200, request)
-            return web.json_response(self.service_status(svc), headers={"Cache-Control": "no-store"})
+            return web.json_response(self.service_status(svc, request), headers={"Cache-Control": "no-store"})
         if request.method != "POST":
             raise web.HTTPMethodNotAllowed(request.method, ["POST"])
         if action == "start":
             if self.paused and svc.state not in (READY, STARTING):
-                return self.paused_error()
+                return self.paused_error(request)
             force = request.query.get("force") == "1"
             w = self.scheduler.want(svc, "switch now (status page)" if force else "status page", force)
             return web.json_response({"ok": True, "want": w.as_dict() if w else None})
@@ -271,7 +307,7 @@ class Hub:
             return pages.dashboard(self, request)
 
         async def status(request):
-            return web.json_response(self.status(), headers={"Cache-Control": "no-store"})
+            return web.json_response(self.status(request), headers={"Cache-Control": "no-store"})
 
         async def events(request):
             return web.json_response(list(self.events))
@@ -311,7 +347,7 @@ class Hub:
         svc = self._svc(request)
         if request.query.get("want") == "1":
             self.scheduler.touch(svc, poll=True)
-        return web.json_response(self.service_status(svc), headers={"Cache-Control": "no-store"})
+        return web.json_response(self.service_status(svc, request), headers={"Cache-Control": "no-store"})
 
     async def _api_log(self, request):
         svc = self._svc(request)
@@ -327,7 +363,7 @@ class Hub:
             if svc.state in (READY, STARTING):
                 return web.json_response({"ok": True, "state": svc.state})
             if self.paused:
-                return self.paused_error()
+                return self.paused_error(request)
             w = self.scheduler.want(svc, reason, request.query.get("force") == "1")
             return web.json_response({"ok": True, "want": w.as_dict() if w else None})
         if action == "cancel":

@@ -10,11 +10,13 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import aiohttp
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from spark_switchboard import config as config_mod  # noqa: E402
+from spark_switchboard import scheduler as scheduler_mod  # noqa: E402
 from spark_switchboard.app import Hub  # noqa: E402
 
 FAKE = str(Path(__file__).with_name("fake_service.py"))
@@ -425,6 +427,53 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
         w.phase = "waiting"
         self.assertTrue(self.hub.scheduler.abandoned(w))
 
+    async def test_a_want_that_made_room_stays_when_its_request_gives_up(self):
+        # A is stopped to make room for B, but its memory comes back late (a container, the driver): after switchboard
+        # stopped waiting for it, and after B's only request gave up. B's want stays (and lapses after want_ttl_s as
+        # usual), so B starts once the memory is back, rather than A and B both staying stopped.
+        await self.start_hub(self.svc("a", mem=80), self.svc("b", mem=80), want_ttl_s=600)
+        self.assertEqual((await self.chat("a"))[0], 200)
+        self.s("a").stop_times = [0.5]                      # so the request is held (its ETA fits its wait)
+
+        async def ghost():                                  # holds A's memory from when A starts stopping
+            await self.until(lambda: self.s("a").state == "stopping")
+            (self.memdir / "ghost.gib").write_text("80")
+        g = asyncio.create_task(ghost())
+        with mock.patch.object(scheduler_mod, "ROOM_WAIT_S", 1):
+            t0 = time.time()
+            code, _, body = await self.chat("b", headers={"X-Switchboard-Wait": "7"})
+        await g
+        self.assertGreater(time.time() - t0, 6)              # held, through making room and then no room
+        self.assertEqual(code, 503, body)
+        err = json.loads(body)["error"]
+        self.assertEqual(err["code"], "no_memory")
+        self.assertNotIn("won't start by itself", err["message"])
+        self.assertIn("b", self.hub.scheduler.wants)
+        self.assertEqual(self.s("a").state, "stopped")
+        (self.memdir / "ghost.gib").unlink()
+        await self.until(lambda: self.s("b").state == "ready", timeout=10)
+
+    async def test_a_probe_that_gives_up_leaves_the_want(self):
+        # An answer given at once (Wait 0) leaves the want, so B starts once its stop is done. A probe (passive_paths)
+        # held meanwhile can't start B, so its giving up doesn't drop that want either.
+        await self.start_hub(self.svc("b", passive_paths=["/probe"], extra_args=("--stop-delay", "6")),
+                             want_ttl_s=600)
+        self.assertEqual((await self.chat("b"))[0], 200)
+        self.s("b").start_times, self.s("b").stop_times = [0.5], [0.1]     # so the probe is held
+        self.assertEqual((await self.admin_post("/api/services/b/stop"))[0], 200)
+        await self.until(lambda: self.s("b").state == "stopping")
+        code, _, body = await self.chat("b", headers={"X-Switchboard-Wait": "0"})
+        self.assertEqual(code, 503)
+        self.assertIn("will start", json.loads(body)["error"]["message"])
+        t0 = time.time()
+        async with self.http.get(self.url("b", "/probe"), headers={"X-Switchboard-Wait": "3"}) as r:
+            self.assertEqual(r.status, 503)
+            self.assertNotIn("won't start by itself", await r.text())
+        self.assertGreater(time.time() - t0, 2.5)            # it was held
+        self.assertEqual(self.s("b").state, "stopping")
+        self.assertIn("b", self.hub.scheduler.wants)
+        await self.until(lambda: self.s("b").state == "ready", timeout=15)
+
     async def test_no_memory_counts_the_reserve_in(self):
         # The answer gives what must really be free (memory_gib + reserve_gib) and free memory as the machine shows it.
         self.memdir.mkdir(parents=True, exist_ok=True)
@@ -486,6 +535,20 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
         code, _, body = await self.chat("big", headers={"X-Switchboard-Wait": "1"})
         self.assertEqual(code, 503)
         self.assertIn("outside switchboard", json.loads(body)["error"]["message"])
+        # Memory that can't be read (a GPU nvidia-smi doesn't answer for) isn't blamed on other software.
+        self.hub.memory.error = "nvidia-smi did not answer within 10 s"
+        code, _, body = await self.chat("big", headers={"X-Switchboard-Wait": "1"})
+        msg = json.loads(body)["error"]["message"]
+        self.assertNotIn("outside switchboard", msg)
+        self.assertIn("would bring it to 21 GiB; nvidia-smi did not answer within 10 s", msg)
+
+    async def test_keep_warm_note_counts_the_reserve_in(self):
+        # As in the no_memory answer: what must really be free (memory_gib + reserve_gib), and free memory as the
+        # machine shows it.
+        await self.start_hub(self.svc("main", mem=8, keep_warm=True), total=8.4, reserve_gib=1)
+        await self.until(lambda: self.s("main").warm_note)
+        self.assertEqual(self.s("main").warm_note, "kept warm: starts when 9 GiB is free (8 GiB now)")
+        self.assertEqual(self.s("main").state, "stopped")
 
     # -- a discrete GPU: GPU memory and host RAM are planned separately ----------------------------------------------
     async def test_discrete_gpu_plans_gpu_memory_and_ram(self):
@@ -522,6 +585,18 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
         (self.memdir / "desktop.gib").unlink()               # the desk is free again: the waiting start goes ahead
         self.assertEqual((await self.chat("b"))[0], 200)
         self.assertEqual(self.s("a").state, "stopped")
+
+    async def test_making_room_stops_only_what_is_needed(self):
+        # RAM is short for B. A (used least recently) holds a bit of RAM, D plenty: stopping D alone makes room, so A
+        # stays up.
+        await self.start_hub(self.svc("a", mem=8, ram=0.05), self.svc("d", mem=1, ram=20), self.svc("b", mem=4, ram=40),
+                             total=32, ram_total=64, ram_reserve_gib=8)
+        self.assertEqual((await self.chat("a"))[0], 200)
+        self.assertEqual((await self.chat("d"))[0], 200)
+        code, _, body = await self.chat("b")
+        self.assertEqual(code, 200, body)
+        self.assertEqual((self.s("a").state, self.s("d").state), ("ready", "stopped"))
+        self.assertIn("making room for B", self.s("d").stop_reason)
 
     # -- pause -----------------------------------------------------------------------------------------------------
     async def test_pause_keeps_keep_warm_down_until_resume(self):
@@ -614,6 +689,8 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
     async def test_only_this_machine_resumes_when_remote_resume_is_off(self):
         await self.start_hub(self.svc("llm"), self.svc("app", kind="web"), remote_resume=False)
         await self.admin_post("/api/pause?reason=in%20use%20at%20the%20desk")
+        # A caller on another machine (every test client is on 127.0.0.1, so the check is replaced)
+        self.hub._local = lambda request: False
         code, headers, body = await self.chat("llm")
         self.assertEqual(code, 503)
         err = json.loads(body)["error"]
@@ -626,8 +703,6 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(r.status, 503)
             paused = (await r.json())["switchboard"]["paused"]
             self.assertEqual((paused["reason"], paused["remote_resume"]), ("in use at the desk", False))
-        # A caller on another machine (every test client is on 127.0.0.1, so the check is replaced)
-        self.hub._local = lambda request: False
         async with self.http.post(self.url("app", "/__switchboard/resume"), headers={"X-Switchboard": "1"}) as r:
             self.assertEqual(r.status, 403)
         code, r = await self.admin_post("/api/resume")
@@ -638,10 +713,20 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("only testbox itself can resume it", r["error"])
         async with self.http.get(self.url("app", "/"), headers={"Accept": "text/html"}) as r:
             self.assertIn('"can_resume": false', await r.text())         # no Resume button
+        async with self.http.get(f"http://127.0.0.1:{self.admin}/") as r:
+            page = await r.text()
+            self.assertIn('"can_resume": false', page)                  # nor Pause: it couldn't undo it
+            self.assertIn("toggle('hidden', !!paused || !SB.can_resume)", page)
         self.assertTrue(self.hub.paused)
-        del self.hub._local                                 # this machine itself
+        del self.hub._local                                 # this machine itself: told how to resume
         async with self.http.get(f"http://127.0.0.1:{self.admin}/") as r:
             self.assertIn('"can_resume": true', await r.text())
+        code, _, body = await self.chat("llm")
+        self.assertEqual(code, 503)
+        self.assertIn("spark-switchboard resume", json.loads(body)["error"]["message"])
+        code, r = await self.admin_post("/api/services/app/start")
+        self.assertEqual(code, 409)
+        self.assertIn("resume it on the dashboard or with `spark-switchboard resume`", r["error"])
         code, r = await self.admin_post("/api/resume")
         self.assertEqual((code, r["resumed"]), (200, True))
         self.assertEqual((await self.chat("llm"))[0], 200)

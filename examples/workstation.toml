@@ -60,7 +60,7 @@ title = "ComfyUI"
 adapter = "comfyui"                      # busy = anything in its queue (GET /queue)
 listen = 8188                            # public port; switchboard answers here
 upstream = "http://127.0.0.1:18188"      # where ComfyUI listens while switchboard runs it (env below)
-memory_gib = 20                          # GPU memory that must be free to start it
+memory_gib = 20                          # GPU memory it needs to start (+ reserve_gib 1 = what must be free)
 max_gib = 31                             # it can fill the GPU while a workflow runs
 ram_gib = 16                             # host RAM it needs to start (+ ram_reserve_gib 8 = COMFY_MIN_FREE_GIB below)
 ram_max_gib = 40                         # models it offloads to RAM

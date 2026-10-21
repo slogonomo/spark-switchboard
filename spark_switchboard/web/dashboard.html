@@ -112,7 +112,8 @@ async function postApi(path) {
 }
 async function act(name, action, extra = '') { await postApi(`/api/services/${name}/${action}${extra}`); poll(); }
 async function pause() {
-  if (!confirm('Pause switchboard?\n\nIt stops every app it runs and starts nothing (no keep-warm, no starts on request) until you resume. Work in progress finishes first.')) return;
+  if (!confirm('Pause switchboard?\n\nIt stops every app it runs and starts nothing (no keep-warm, no starts on request) until you resume'
+    + (SB.pause_persists ? ', also across restarts and reboots' : '') + '. Work in progress finishes first.')) return;
   const j = await postApi('/api/pause?reason=dashboard');
   const busy = Object.entries(j.services || {}).filter(([n, w]) => w.startsWith('busy')).map(([n, w]) => n + ': ' + w);
   if (busy.length) toast(busy.join('; '));
@@ -142,7 +143,8 @@ function render(st) {
   $('h').textContent = 'switchboard · ' + st.host;
   const paused = st.paused;
   $('paused').classList.toggle('hidden', !paused);
-  $('btn-pause').classList.toggle('hidden', !!paused);
+  // A viewer who can't resume (remote_resume = false, on another machine) gets no Pause either: it couldn't undo it.
+  $('btn-pause').classList.toggle('hidden', !!paused || !SB.can_resume);
   if (paused) $('paused-text').textContent = 'for ' + ago(st.time - paused.since) + ' (' + paused.reason + '): nothing starts, and each app switchboard runs is stopped once its work is done. '
     + (paused.persists ? 'It stays paused across restarts and reboots until resumed.' : 'A restart of switchboard also resumes.')
     + (SB.can_resume ? '' : ' Only ' + st.host + ' itself can resume it.');

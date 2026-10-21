@@ -8,7 +8,8 @@
 #   2. Creates .venv in this repo and pip-installs the repo into it.
 #   3. Finds the config: --config, $SWITCHBOARD_CONFIG, ~/.config/spark-switchboard/switchboard.toml
 #      ($XDG_CONFIG_HOME), /etc/spark-switchboard/switchboard.toml. If there is none, it copies
-#      examples/switchboard.toml and examples/services/ to ~/.config/spark-switchboard/ and stops: edit it, then rerun.
+#      examples/switchboard.toml and examples/services/ (except the files marked DEPRECATED) to
+#      ~/.config/spark-switchboard/ and stops: edit it, then rerun.
 #   4. Runs `spark-switchboard check` on it.
 #   5. Renders deploy/spark-switchboard.service for this user and installs it as
 #      /etc/systemd/system/spark-switchboard.service, then enables and (re)starts it.

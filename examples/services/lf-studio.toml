@@ -3,6 +3,8 @@
 # MiniMax H3 and Lightricks LTX-2.5 models; their weights are downloaded separately, under their own licenses (see
 # that repository's README, "Model terms"). Install it per its README, e.g.
 #   git clone https://github.com/slogonomo/lf-studio.git ~/src/lf-studio
+# This file needs LF Studio 0.5 or newer (its launcher bin/lf-studio); for Sol-H3 Studio 0.4, use the deprecated
+# sol-h3-studio.toml next to this file instead.
 # This file is the same as that repository's integrations/spark-switchboard/lf-studio.toml, except that it ships
 # disabled. Cloned elsewhere? Change the two "~/src/lf-studio" paths in command and kill_command. Its launcher
 # (bin/lf-studio) follows the launcher contract (README, "Writing a launcher") and writes the pidfile named below, so

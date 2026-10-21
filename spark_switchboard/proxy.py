@@ -65,7 +65,7 @@ class Proxy:
             except UpstreamDown as e:
                 # The launcher may just have died; its supervisor notices within a few seconds.
                 self.hub.event(svc.name, f"{svc.title} not answering on {svc.cfg.upstream}: {e}", "warning")
-                info = self.info(svc, kind)
+                info = self.info(svc, kind, request=request)
                 info.update(status=502, code="upstream_down", retry_after=10,
                             message=f"{svc.title} on {self.hub.cfg.hostname} is not answering; try again shortly.")
                 return svc.adapter.unavailable(request, svc, info)
@@ -84,14 +84,14 @@ class Proxy:
         if self.hub.paused:                 # starts nothing and holds nothing
             if kind == NAVIGATE:
                 return pages.service_page(self.hub, svc, 503, request)
-            return svc.adapter.unavailable(request, svc, self.info(svc, kind))
+            return svc.adapter.unavailable(request, svc, self.info(svc, kind, request=request))
         if kind == NAVIGATE:
             self._want_from_browser(svc)
             return pages.service_page(self.hub, svc, 503, request)
         pending = svc.name in sched.wants or svc.state == STARTING
         recently_failed = svc.state == FAILED and time.time() - svc.since < 60
         if kind in (TAB, PASSIVE) and not pending or recently_failed and not pending:
-            return svc.adapter.unavailable(request, svc, self.info(svc, kind))
+            return svc.adapter.unavailable(request, svc, self.info(svc, kind, request=request))
         if kind == WAKE:
             client = request.headers.get("User-Agent", "").split(" ")[0][:40] or "a client"
             sched.want(svc, f"{request.method} {request.path} ({client} from {request.remote})")
@@ -99,22 +99,24 @@ class Proxy:
         wait = self.hold_window(request, svc)
         eta = sched.eta(svc)
         if wait <= 0 or (eta is not None and eta > wait):
-            return svc.adapter.unavailable(request, svc, self.info(svc, kind))
+            return svc.adapter.unavailable(request, svc, self.info(svc, kind, request=request))
         if eta is None and kind != WAKE:
             # Waiting on other services: don't hold a tab's background requests (they'd use up the browser's few
             # connections to this host, which the status page needs too).
-            return svc.adapter.unavailable(request, svc, self.info(svc, kind))
+            return svc.adapter.unavailable(request, svc, self.info(svc, kind, request=request))
         w = sched.wants.get(svc.name)
         if await sched.wait_ready(svc, wait, interest=(kind == WAKE)) and svc.state == READY:
             try:
                 return await self.forward(request, svc, kind)
             except UpstreamDown:
                 pass
-        if w is not None and sched.abandoned(w):         # this was the last request waiting for it
-            info = self.info(svc, kind, gave_up=True)
+        # The last request waiting for it gave up. Only one that could start it: an open tab's background requests and
+        # probes (TAB, PASSIVE) never start or keep a want, so they don't drop one either.
+        if kind == WAKE and w is not None and sched.abandoned(w):
+            info = self.info(svc, kind, gave_up=True, request=request)
             sched.cancel(svc, "dropped: the request waiting for it gave up")
             return svc.adapter.unavailable(request, svc, info)
-        return svc.adapter.unavailable(request, svc, self.info(svc, kind))
+        return svc.adapter.unavailable(request, svc, self.info(svc, kind, request=request))
 
     def hold_window(self, request, svc):
         h = request.headers.get("X-Switchboard-Wait")
@@ -125,9 +127,10 @@ class Proxy:
                 pass
         return svc.cfg.hold_s
 
-    def info(self, svc, kind=None, gave_up=False):
+    def info(self, svc, kind=None, gave_up=False, request=None):
         """What to tell a client that can't be served right now. gave_up: the want goes with this answer (nobody else
-        waits for it), so it won't start by itself."""
+        waits for it), so it won't start by itself. request: the client's, so that while paused a client that may
+        resume (remote_resume, or this machine itself) is told how."""
         sched = self.hub.scheduler
         host = self.hub.cfg.hostname
         w = sched.wants.get(svc.name)
@@ -144,13 +147,13 @@ class Proxy:
         elif svc.state == STOPPING and w is None:
             msg = f"{svc.title} on {host} is stopping ({svc.stop_reason})."
             code = "stopping"
-        elif self.hub.paused and self.hub.cfg.remote_resume:
+        elif self.hub.paused and self.hub.may_resume(request):
             msg = (f"switchboard on {host} is paused, so it doesn't start {svc.title}; resume it on the dashboard "
                    f"(http://{host}:{self.hub.cfg.admin_port}/) or with `spark-switchboard resume`.")
             code = "paused"
         elif self.hub.paused:
-            # Typically a workstation whose owner is using it: say why and for how long, and don't invite callers on
-            # other machines to resume it (they can't).
+            # Typically a workstation whose owner is using it: say why and for how long, and don't invite a caller on
+            # another machine to resume it (it can't).
             msg = (f"switchboard on {host} has been paused for {ago(time.time() - self.hub.paused_since)} "
                    f"({self.hub.paused_reason}), so it doesn't start {svc.title}; only {host} itself can resume it. "
                    "Try again later.")

@@ -18,6 +18,7 @@ import asyncio
 import fnmatch
 import os
 import re
+import shutil
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -87,15 +88,47 @@ def parse_compute_apps(text, uuid=None):
     return gpu
 
 
+RETRY_AFTER_TIMEOUT_S = 30    # a command that timed out isn't run again for this long
+_timed_out = {}               # program's path -> (its process that timed out, when, why)
+
+
 async def _run(*cmd, timeout=10):
-    """stdout of a short command, or None when it is missing, fails or is slow."""
+    """(stdout, None) of a short command, or (None, why) when it is missing, fails or is slow. One that is slow is
+    killed. After a timeout the program isn't run again for RETRY_AFTER_TIMEOUT_S, nor while the process that timed
+    out is still alive (one stuck in the driver can't be killed): a hanging nvidia-smi neither piles up processes nor
+    holds up every scheduler tick for `timeout` seconds."""
+    name = os.path.basename(cmd[0])
+    key = shutil.which(cmd[0]) or cmd[0]
+    if key in _timed_out:
+        p, at, why = _timed_out[key]
+        if p.returncode is None or time.monotonic() - at < RETRY_AFTER_TIMEOUT_S:
+            return None, why
+        del _timed_out[key]
     try:
-        p = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
-                                                 stderr=asyncio.subprocess.DEVNULL)
-        out, _ = await asyncio.wait_for(p.communicate(), timeout)
-    except (OSError, asyncio.TimeoutError):
-        return None
-    return out.decode(errors="replace") if p.returncode == 0 else None
+        p = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+    except FileNotFoundError:
+        return None, f"{name} not found (not installed, or not on PATH)"
+    except OSError as e:
+        return None, f"{name} could not run ({e.strerror or e})"
+    try:
+        out, err = await asyncio.wait_for(p.communicate(), timeout)
+    except asyncio.TimeoutError:
+        try:
+            p.kill()
+        except ProcessLookupError:
+            pass
+        try:
+            await asyncio.wait_for(p.wait(), 2)
+        except asyncio.TimeoutError:
+            pass
+        why = f"{name} did not answer within {timeout:g} s"
+        _timed_out[key] = (p, time.monotonic(), why)
+        return None, why
+    if p.returncode != 0:
+        # nvidia-smi prints its errors ("Failed to initialize NVML: Driver/library version mismatch") on stdout
+        lines = [x.strip() for x in (out + b"\n" + err).decode(errors="replace").splitlines() if x.strip()]
+        return None, f"{name} failed (exit {p.returncode})" + (f": {lines[0][:200]}" if lines else "")
+    return out.decode(errors="replace"), None
 
 
 def _meminfo():
@@ -210,30 +243,28 @@ class SystemMemory:
 
     async def _gpu(self):
         """{pid: MiB} of GPU allocations; empty when nvidia-smi is missing or slow."""
-        out = await _run("nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits")
+        out, _ = await _run("nvidia-smi", "--query-compute-apps=pid,used_memory", "--format=csv,noheader,nounits")
         return parse_compute_apps(out or "")
 
     async def _container_names(self):
-        """{full container id: name} from `docker ps` (with Podman, its docker-compatible CLI)."""
+        """{full container id: name} from `docker ps` (with Podman, its docker-compatible CLI); the last names when it
+        fails."""
         if time.monotonic() - self._containers_at < 15:
             return self._containers
-        try:
-            p = await asyncio.create_subprocess_exec(
-                "docker", "ps", "--no-trunc", "--format", "{{.ID}} {{.Names}}",
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
-            out, _ = await asyncio.wait_for(p.communicate(), 10)
-            self._containers = dict(line.split(" ", 1) for line in out.decode().splitlines() if " " in line)
-            self._containers_at = time.monotonic()
-        except (OSError, asyncio.TimeoutError):
-            pass
+        out, _ = await _run("docker", "ps", "--no-trunc", "--format", "{{.ID}} {{.Names}}")
+        if out is not None:
+            self._containers = dict(line.split(" ", 1) for line in out.splitlines() if " " in line)
+        self._containers_at = time.monotonic()
         return self._containers
 
 
 class GPUMemory(SystemMemory):
     """One discrete NVIDIA GPU: its free memory (nvidia-smi, refreshed by refresh()) and host RAM (MemAvailable).
-    `gpu` is the GPU's nvidia-smi index or UUID. Until nvidia-smi has answered once, the GPU counts as full; after a
-    failure the last numbers stay, and `error` says why."""
+    `gpu` is the GPU's nvidia-smi index or UUID. Until nvidia-smi has answered once, the GPU counts as full. After a
+    failure the last free figure stays for STALE_S (one slow answer changes nothing), then the GPU counts as full again
+    until nvidia-smi answers: something else may have taken the memory meanwhile. `error` says why."""
     pools = ("gpu", "ram")
+    STALE_S = 60
 
     def __init__(self, opts):
         super().__init__(opts)
@@ -242,22 +273,25 @@ class GPUMemory(SystemMemory):
         self.name = None
         self.uuid = None
         self._total = self._free = 0.0          # GiB, from the last good nvidia-smi
+        self._read_at = None                    # time.monotonic() of the last good nvidia-smi
 
     def total(self):
         return {"gpu": self._total, "ram": _meminfo()["MemTotal"] / 2**20}
 
     def available(self):
-        return {"gpu": self._free, "ram": _meminfo()["MemAvailable"] / 2**20}
+        fresh = self._read_at is not None and (self.error is None or time.monotonic() - self._read_at < self.STALE_S)
+        return {"gpu": self._free if fresh else 0.0, "ram": _meminfo()["MemAvailable"] / 2**20}
 
     async def refresh(self):
-        out = await _run("nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.free",
-                         "--format=csv,noheader,nounits")
-        self.error = self.read(out)
+        out, why = await _run("nvidia-smi", "--query-gpu=index,uuid,name,memory.total,memory.free",
+                              "--format=csv,noheader,nounits")
+        self.error = self.read(out, why)
 
-    def read(self, out):
-        """Take in nvidia-smi's --query-gpu output (None: it failed). Returns the error text, or None."""
+    def read(self, out, why=None):
+        """Take in nvidia-smi's --query-gpu output (None: it failed, for the reason `why`). Returns the error text, or
+        None."""
         if out is None:
-            return "nvidia-smi did not answer (no NVIDIA driver, or it is busy)"
+            return why or "nvidia-smi failed"
         g = pick_gpu(parse_gpus(out), self.gpu)
         if g is None:
             return f"nvidia-smi lists no GPU {self.gpu!r} (set [memory] gpu to an index or UUID it lists)"
@@ -266,6 +300,7 @@ class GPUMemory(SystemMemory):
                     "(DGX Spark) use [memory] source = \"system\"")
         self.name, self.uuid = g["name"], g["uuid"]
         self._total, self._free = g["total_mib"] / 1024, g["free_mib"] / 1024
+        self._read_at = time.monotonic()
         return None
 
     async def usage(self, services):
@@ -274,7 +309,8 @@ class GPUMemory(SystemMemory):
 
     async def _gpu(self):
         """{pid: MiB} of allocations on this GPU only."""
-        out = await _run("nvidia-smi", "--query-compute-apps=pid,used_memory,gpu_uuid", "--format=csv,noheader,nounits")
+        out, _ = await _run("nvidia-smi", "--query-compute-apps=pid,used_memory,gpu_uuid",
+                            "--format=csv,noheader,nounits")
         return parse_compute_apps(out or "", self.uuid)
 
 
