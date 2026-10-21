@@ -10,7 +10,7 @@ streams and websockets.
   apps should run only on request and a pause keeps them off.
 - **Needs:** Linux with systemd, Python 3.11 or newer, and the apps themselves, installed separately, each with a
   launcher script. Examples are included for ComfyUI, Open WebUI, MiaAI-Lab's TensorFold recipe and
-  [Sol-H3 Studio](https://github.com/slogonomo/sol-h3-studio).
+  [LF Studio](https://github.com/slogonomo/lf-studio) (called Sol-H3 Studio before its 0.5).
 
 Unofficial. Not affiliated with or endorsed by NVIDIA.
 
@@ -25,7 +25,7 @@ Unofficial. Not affiliated with or endorsed by NVIDIA.
  └──────┬──────────────────┬──────────────────┬──────────────────┘
         │ 127.0.0.1:18888  │ :18188           │ :18190 ...   (internal ports)
         ▼                  ▼                  ▼
-   tensorfold.sh       comfyui.sh       sol-h3-studio      ← each app's own launcher
+   tensorfold.sh       comfyui.sh       lf-studio          ← each app's own launcher
 ```
 
 The apps stay independent. switchboard runs each app's launcher with `SWITCHBOARD=1` and an internal port taken from
@@ -402,7 +402,7 @@ a directory with `python3 -m http.server`). To start your own, copy it into `exa
 | `tensorfold.sh` | MiaAI-Lab's TensorFold recipe through its own `start.sh` / `stop.sh`; optional checkpoint pre-read (load 93–98 s → 54–56 s, measured on a DGX Spark), page-cache drop when MemFree is low, fast stop while loading | `TF_RECIPE_DIR`, `TF_HOST`, `TF_PORT`, `TF_CONTAINER`, `TF_SERVED_NAME`, `TF_MIN_FREE_GIB`, `TF_PREREAD`, `TF_PREREAD_TABLE`, `TF_MIN_MEMFREE_GIB`, `TF_MEM_FLOOR_GIB` |
 
 Each file's header lists every setting with its default. A launcher doesn't have to use common.sh or bash; the
-companion [sol-h3-studio](https://github.com/slogonomo/sol-h3-studio) repository ships its own launcher that
+companion [lf-studio](https://github.com/slogonomo/lf-studio) repository ships its own launcher that
 follows the same contract.
 
 ## Configuration reference
@@ -506,12 +506,12 @@ NVIDIA Sync custom apps run a command on the Spark and forward its port to your 
 **While switchboard runs, open any app it manages with
 [`delegate.sh`](examples/launchers/delegate.sh).** Give the custom app the command
 `bash ~/src/spark-switchboard/examples/launchers/delegate.sh NAME` (NAME is the service name: its file name without
-`.toml`) and the app's public port (`listen`), for example `delegate.sh sol-h3-studio` with port 8190. delegate.sh
+`.toml`) and the app's public port (`listen`), for example `delegate.sh lf-studio` with port 8190. delegate.sh
 never starts the app itself. It asks switchboard to start it (`POST /api/services/NAME/start`), prints switchboard's
 progress as STATUS lines, and stays in the foreground, so Sync shows the app as running and keeps its port forward.
 When you close the app in Sync (SIGTERM or SIGHUP, or its parent going away), it asks switchboard to stop the app
 unless someone used it recently (`stop?if_idle=1`). This works for every service, including
-[Sol-H3 Studio](https://github.com/slogonomo/sol-h3-studio), whose own launcher has no delegate, and over plain ssh
+[LF Studio](https://github.com/slogonomo/lf-studio), whose own launcher has no delegate, and over plain ssh
 too. While switchboard is [paused](#dashboard-cli-and-admin-api) it says so, and asks again once switchboard is
 resumed. If switchboard isn't answering or doesn't run NAME, delegate.sh says so and exits 1.
 
@@ -524,7 +524,7 @@ resumed. If switchboard isn't answering or doesn't run NAME, delegate.sh says so
 - **switchboard running:** the launcher's delegate (in common.sh) sees that switchboard knows the app and does what
   delegate.sh does. Apps switchboard doesn't know (or has disabled) run standalone.
 
-A launcher without that delegate (such as Sol-H3 Studio's `bin/sol-h3-studio`) refuses to start from Sync while
+A launcher without that delegate (such as LF Studio's `bin/lf-studio`) refuses to start from Sync while
 switchboard holds its public port; use delegate.sh for it. An app opened from Sync *before* switchboard started keeps
 running as an [external](#operations) app: switchboard never stops it and takes over its port only once you close it.
 
@@ -649,7 +649,7 @@ which mostly can't fit together:
 | --- | --- | --- | --- | --- | --- |
 | Qwen3.8 Flash Next on TensorFold (OpenAI API) | `tensorfold.toml`, `tensorfold.sh` | 8888 | 115 GiB | ~110 GiB | kept warm: the default resident; loads in ~70 s; 2 min quiet |
 | ComfyUI | `comfyui.toml`, `comfyui.sh` | 8188 | 60 GiB | ~95 GiB (two-stage video) | stops after 30 min unused; 5 min quiet |
-| [Sol-H3 Studio](https://github.com/slogonomo/sol-h3-studio) | `sol-h3-studio.toml` | 8190 | 110 GiB | 117 GiB (a cap: nearly the whole machine) | stops after 30 min unused; busy while a job runs |
+| [LF Studio](https://github.com/slogonomo/lf-studio) | `lf-studio.toml` | 8190 | 110 GiB | 117 GiB (a cap: nearly the whole machine) | stops after 30 min unused; busy while a job runs |
 | Open WebUI | `open-webui.toml`, `open-webui.sh` | 12000 | 4 GiB | ~2 GiB (idles at 1.5) | fits next to any of them |
 
 In practice: the LLM is up most of the time, so agents and Open WebUI (which reaches it through switchboard's port
@@ -664,17 +664,24 @@ Spark: reading the checkpoint shards into the page cache before `start.sh` cut t
 (`TF_PREREAD`), and reading the n-gram table after the server is ready cut the first 30k-token prompt from 47 s to
 18 s (`TF_PREREAD_TABLE`, off by default).
 
-Sol-H3 Studio is the companion [sol-h3-studio](https://github.com/slogonomo/sol-h3-studio) repository: a web studio
-and launcher for NVIDIA Research's Sol-H3-Spark video and audio pipeline on one DGX Spark. The pipeline runs MiniMax
-H3 and Lightricks LTX-2.5 models, whose weights are downloaded separately under their own licenses (see that
-repository's [Model terms](https://github.com/slogonomo/sol-h3-studio#model-terms)). Install it per its README:
+LF Studio is the companion [lf-studio](https://github.com/slogonomo/lf-studio) repository: a web studio and
+launcher for NVIDIA Research's Sol-H3-Spark video and audio pipeline on one DGX Spark. The pipeline runs MiniMax H3
+and Lightricks LTX-2.5 models, whose weights are downloaded separately under their own licenses (see that
+repository's [Model terms](https://github.com/slogonomo/lf-studio#model-terms)). Install it per its README:
 
 ```bash
-git clone https://github.com/slogonomo/sol-h3-studio.git ~/src/sol-h3-studio
+git clone https://github.com/slogonomo/lf-studio.git ~/src/lf-studio
 ```
 
-`examples/services/sol-h3-studio.toml` is the same as its `integrations/spark-switchboard/sol-h3-studio.toml`,
-shipped disabled. Open it from NVIDIA Sync with [`delegate.sh`](#nvidia-sync).
+`examples/services/lf-studio.toml` is the same as its `integrations/spark-switchboard/lf-studio.toml`, shipped
+disabled. Open it from NVIDIA Sync with [`delegate.sh`](#nvidia-sync).
+
+Before its 0.5 it was called Sol-H3 Studio (repository `sol-h3-studio`, launcher `bin/sol-h3-studio`, settings
+`SOLH3_*`). `examples/services/sol-h3-studio.toml`, the service file for those names, stays for one more release and
+is marked deprecated; install.sh no longer copies it into a new config. A config that uses it keeps working while the
+studio still accepts the old names (until its 0.6). To move: copy `lf-studio.toml` into your config's `services/`,
+move the old file out, and rename the service where you use its name (`delegate.sh lf-studio`). Its public port stays
+8190.
 
 ## Limits
 
@@ -718,8 +725,9 @@ python3 -m venv .venv && .venv/bin/pip install -e .
 - `tests/test_config.py` (24): config discovery, the CLI's admin URL, container ids from cgroup paths (systemd,
   cgroupfs, Podman), the local-client check, config keys in every table, `bind = "::"`, the shipped examples
   (including `examples/workstation.toml`), reading a discrete GPU through a fake `nvidia-smi` (also in `check`), and
-  (when the companion [sol-h3-studio](https://github.com/slogonomo/sol-h3-studio) repo is checked out next to
-  this one) that the Sol-H3 Studio example matches its copy there.
+  (when the companion [lf-studio](https://github.com/slogonomo/lf-studio) repo is checked out next to this one,
+  under its new or old directory name) that the LF Studio example, and the deprecated Sol-H3 Studio one, match their
+  copies there.
 
 ## Prior art and credits
 
@@ -737,11 +745,11 @@ python3 -m venv .venv && .venv/bin/pip install -e .
   [Qwen3.8 Flash Next on one DGX Spark (TensorFold)](https://github.com/MiaAI-Lab/Qwen3.8-Flash-Next-Single-DGX-Spark-TensorFold)
   by MiaAI-Lab (MIT), built on [TensorFold](https://github.com/ashhart/TensorFold) by Ash Hart and the TensorFold
   contributors (Apache-2.0). Neither is bundled.
-- The example Sol-H3 Studio service runs the companion
-  [sol-h3-studio](https://github.com/slogonomo/sol-h3-studio) repository, a web studio for NVIDIA Research's
+- The example LF Studio service runs the companion
+  [lf-studio](https://github.com/slogonomo/lf-studio) repository, a web studio for NVIDIA Research's
   Sol-H3-Spark pipeline. That pipeline runs MiniMax H3 and Lightricks LTX-2.5 models, whose weights are downloaded
   separately under their own licenses (see its
-  [Model terms](https://github.com/slogonomo/sol-h3-studio#model-terms)). None of it is bundled.
+  [Model terms](https://github.com/slogonomo/lf-studio#model-terms)). None of it is bundled.
 - [ComfyUI](https://github.com/Comfy-Org/ComfyUI) (GPL-3.0) and [Open WebUI](https://github.com/open-webui/open-webui)
   are run by the example launchers as separate apps; neither is bundled.
 - [aiohttp](https://github.com/aio-libs/aiohttp) (Apache-2.0; its bundled llhttp parser is MIT) is the only runtime

@@ -260,8 +260,13 @@ class Keys(Tmp):
 class Examples(unittest.TestCase):
     def test_example_config_loads_and_is_consistent(self):
         cfg = config_mod.load(REPO / "examples" / "switchboard.toml")
-        self.assertEqual(set(cfg.services), {"open-webui", "comfyui", "tensorfold", "sol-h3-studio"})
-        ports = [p for s in cfg.services.values() for p in s.listen]
+        self.assertEqual(set(cfg.services), {"open-webui", "comfyui", "tensorfold", "lf-studio", "sol-h3-studio"})
+        # sol-h3-studio.toml is the deprecated copy of lf-studio.toml for the studio's old names (same port)
+        deprecated = {n for n in cfg.services
+                      if (REPO / "examples" / "services" / f"{n}.toml").read_text().startswith("# DEPRECATED")}
+        self.assertEqual(deprecated, {"sol-h3-studio"})
+        self.assertEqual(cfg.services["sol-h3-studio"].listen, cfg.services["lf-studio"].listen)
+        ports = [p for s in cfg.services.values() if s.name not in deprecated for p in s.listen]
         self.assertEqual(len(ports), len(set(ports)))
         self.assertNotIn(cfg.admin_port, ports)
         launchers = REPO / "examples" / "launchers"
@@ -295,17 +300,26 @@ class Examples(unittest.TestCase):
         self.assertTrue(s.command[-1].endswith("/examples/launchers/comfyui.sh"))
         self.assertIn("\nAPP=comfyui\n", (REPO / "examples" / "launchers" / "comfyui.sh").read_text())
 
-    def test_sol_h3_studio_matches_the_companion_repo(self):
-        # examples/services/sol-h3-studio.toml is the companion repo's integrations/spark-switchboard/sol-h3-studio.toml,
-        # shipped disabled (header comments aside). Checked when that repo is checked out next to this one.
-        companion = REPO.parent / "sol-h3-studio" / "integrations" / "spark-switchboard" / "sol-h3-studio.toml"
-        if not companion.is_file():
-            self.skipTest(f"{companion} is not there")
-        ours = tomllib.loads((REPO / "examples" / "services" / "sol-h3-studio.toml").read_text())
-        theirs = tomllib.loads(companion.read_text())
-        self.assertIs(ours.pop("enabled"), False)
-        self.assertIs(theirs.pop("enabled", True), True)
-        self.assertEqual(ours, theirs)
+    def test_lf_studio_matches_the_companion_repo(self):
+        # examples/services/lf-studio.toml is the companion repo's integrations/spark-switchboard/lf-studio.toml,
+        # shipped disabled (header comments aside), and the deprecated sol-h3-studio.toml its file of the same name.
+        # Checked when that repo is checked out next to this one, under its new name or its old one (sol-h3-studio,
+        # before its 0.5), for each of the two files it has.
+        checked = []
+        for repo in ("lf-studio", "sol-h3-studio"):
+            for name in ("lf-studio", "sol-h3-studio"):
+                companion = REPO.parent / repo / "integrations" / "spark-switchboard" / f"{name}.toml"
+                if not companion.is_file():
+                    continue
+                with self.subTest(companion=str(companion)):
+                    ours = tomllib.loads((REPO / "examples" / "services" / f"{name}.toml").read_text())
+                    theirs = tomllib.loads(companion.read_text())
+                    self.assertIs(ours.pop("enabled"), False)
+                    self.assertIs(theirs.pop("enabled", True), True)
+                    self.assertEqual(ours, theirs)
+                checked.append(companion)
+        if not checked:
+            self.skipTest(f"no lf-studio or sol-h3-studio checkout next to {REPO}")
 
     def test_check_command_on_the_examples(self):
         env = {k: v for k, v in os.environ.items() if not k.startswith("SWITCHBOARD")}
@@ -313,7 +327,7 @@ class Examples(unittest.TestCase):
         r = subprocess.run([sys.executable, "-m", "spark_switchboard", "check"], cwd=REPO, env=env,
                            capture_output=True, text=True, timeout=30)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertEqual(r.stdout.count(" off :"), 4, r.stdout)
+        self.assertEqual(r.stdout.count(" off :"), 5, r.stdout)
 
 
 SMI = """#!/bin/sh

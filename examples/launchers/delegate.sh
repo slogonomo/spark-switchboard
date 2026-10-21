@@ -4,10 +4,10 @@
 # ">>> STATUS:" lines, and stays in the foreground, so Sync shows the app as running and keeps its port forward.
 # When it is closed (SIGTERM, SIGHUP, Ctrl-C, or its parent goes away) it asks switchboard to stop SERVICE unless
 # someone used it recently (stop?if_idle=1). It never starts the app itself, so it works for any service in your
-# switchboard config, including apps whose own launcher has no delegate (such as Sol-H3 Studio,
-# https://github.com/slogonomo/sol-h3-studio).
+# switchboard config, including apps whose own launcher has no delegate (such as LF Studio,
+# https://github.com/slogonomo/lf-studio).
 #
-#   NVIDIA Sync custom app:  command  bash ~/src/spark-switchboard/examples/launchers/delegate.sh sol-h3-studio
+#   NVIDIA Sync custom app:  command  bash ~/src/spark-switchboard/examples/launchers/delegate.sh lf-studio
 #                            port     8190   (the service's public port, `listen` in its service file)
 #
 # Settings (environment):

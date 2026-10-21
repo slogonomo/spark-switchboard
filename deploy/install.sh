@@ -108,6 +108,7 @@ if [[ -z "$CONFIG" ]]; then
     [[ -e "$dir/switchboard.toml" ]] || { run cp "$REPO/examples/switchboard.toml" "$dir/switchboard.toml"; copied+=("$dir/switchboard.toml"); }
     for f in "$REPO"/examples/services/*.toml; do
         [[ -e "$dir/services/$(basename "$f")" ]] && continue
+        [[ "$(head -1 "$f")" == "# DEPRECATED"* ]] && continue      # kept for old configs only
         run cp "$f" "$dir/services/"
         copied+=("$dir/services/$(basename "$f")")
     done

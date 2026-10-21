@@ -8,6 +8,6 @@ Corporation. NVIDIA, DGX, DGX Spark, GB10 and NVIDIA Sync are trademarks of NVID
 are the trademarks of their owners and are used only to describe compatibility.
 
 The example launchers and service files in examples/ start software that is not part of this product and is not
-distributed with it (ComfyUI, Open WebUI, the TensorFold recipe by MiaAI-Lab, Sol-H3 Studio from
-https://github.com/slogonomo/sol-h3-studio). Each is under its own license, and the models those apps run (for
-example MiniMax H3 and Lightricks LTX-2.5 for Sol-H3 Studio) are under their own terms.
+distributed with it (ComfyUI, Open WebUI, the TensorFold recipe by MiaAI-Lab, LF Studio, formerly Sol-H3 Studio,
+from https://github.com/slogonomo/lf-studio). Each is under its own license, and the models those apps run (for
+example MiniMax H3 and Lightricks LTX-2.5 for LF Studio) are under their own terms.

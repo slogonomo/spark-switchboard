@@ -1,0 +1,47 @@
+# LF Studio (called Sol-H3 Studio before 0.5): a web studio for NVIDIA Research's Sol-H3-Spark video and audio
+# pipeline on one DGX Spark, from the companion repository https://github.com/slogonomo/lf-studio. The pipeline runs
+# MiniMax H3 and Lightricks LTX-2.5 models; their weights are downloaded separately, under their own licenses (see
+# that repository's README, "Model terms"). Install it per its README, e.g.
+#   git clone https://github.com/slogonomo/lf-studio.git ~/src/lf-studio
+# This file is the same as that repository's integrations/spark-switchboard/lf-studio.toml, except that it ships
+# disabled. Cloned elsewhere? Change the two "~/src/lf-studio" paths in command and kill_command. Its launcher
+# (bin/lf-studio) follows the launcher contract (README, "Writing a launcher") and writes the pidfile named below, so
+# a restarted switchboard re-adopts it. To open it from NVIDIA Sync while switchboard runs it, use
+# examples/launchers/delegate.sh (README, "NVIDIA Sync"). Replaces sol-h3-studio.toml.
+enabled = false                          # true once lf-studio is installed
+title = "LF Studio"
+adapter = "web"
+listen = 8190                            # public port; switchboard answers here
+upstream = "http://127.0.0.1:18190"      # where the studio listens while switchboard runs it (env below)
+memory_gib = 110                         # same as the launcher's LFSTUDIO_MIN_FREE_GIB
+max_gib = 117                            # a cap: it can grow to nearly the whole machine
+priority = 10
+idle_grace_s = 300
+idle_stop_s = 1800                       # stop after 30 min unused
+hold_s = 120
+pidfile = "~/.local/state/lf-studio/launcher.pid"
+containers = ["sol-h3-qwen-*"]           # the Qwen prompt-encoder containers its pipeline starts
+# Requests that never start a stopped studio (503 "stopped" instead): the ready probe, and the reads that scripts and
+# agents poll (lf-studio docs/API.md): the state, clip records, waits and the waited download, posters.
+# /video/*, /input/* and every POST still start it.
+passive_paths = ["/health", "/api/state", "/api/jobs", "/api/jobs/*", "/poster/*"]
+
+[busy_probe]                             # busy while any job is queued or running
+path = "/api/state"
+list = "jobs"
+field = "status"
+idle_values = ["done", "failed", "cancelled"]   # a job's final statuses ("cancelled" since 0.3)
+
+[run]
+command = ["bash", "~/src/lf-studio/bin/lf-studio"]
+# LFSTUDIO_STOP_WAIT_S: the launcher gives the server 75 s to close its pipeline (it needs ~40 s), which leaves time
+# for its own cleanup (workers, Qwen container) before switchboard's stop_timeout_s of 90 s runs out
+env = { LFSTUDIO_PORT = "18190", LFSTUDIO_HOST = "127.0.0.1", LFSTUDIO_PIDFILE = "~/.local/state/lf-studio/launcher.pid", LFSTUDIO_STOP_WAIT_S = "75" }
+stop_timeout_s = 90                      # the server closes its pipeline (workers, Qwen container) in up to ~40 s
+# after a SIGKILL of the launcher's process group: kill the server, the pipeline workers (own sessions) and
+# remove the Qwen containers; the launcher reads the package path from its env file
+kill_command = ["bash", "~/src/lf-studio/bin/lf-studio", "--kill"]
+
+[ready]
+path = "/health"
+estimate_s = 10
