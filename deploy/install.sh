@@ -130,7 +130,31 @@ else
 fi
 
 # 5. systemd unit (and the optional sudoers rule)
-if getent group docker >/dev/null; then
+# Does a service in the config name docker containers (`containers`, enabled or not)? Exit 0 yes, 1 no, 2 can't tell.
+# Plain tomllib, so it works before the venv exists (dry run).
+uses_containers() {
+    "$PY" - "$CONFIG" <<'EOF'
+import glob, os, sys, tomllib
+from pathlib import Path
+main = Path(sys.argv[1])
+try:
+    raw = tomllib.loads(main.read_text())
+    files = []
+    for pattern in raw.get("include", []):
+        p = Path(os.path.expandvars(os.path.expanduser(pattern)))
+        files += glob.glob(str(p if p.is_absolute() else main.parent / p))
+    services = list(raw.get("service", {}).values()) + [tomllib.loads(Path(f).read_text()) for f in files]
+except (OSError, tomllib.TOMLDecodeError):
+    sys.exit(2)
+sys.exit(0 if any(s.get("containers") for s in services) else 1)
+EOF
+}
+# Docker access is root-equivalent: the service gets the docker group only when an app it runs uses containers.
+AFTER_DOCKER=" docker.service"
+if uses_containers; [[ $? == 1 ]]; then
+    SUPP="# SupplementaryGroups=docker left out: no service in the config names containers"
+    AFTER_DOCKER=""
+elif getent group docker >/dev/null; then
     SUPP="SupplementaryGroups=docker"
     if ! id -nG "$USER_NAME" | grep -qw docker; then
         say "warning: $USER_NAME is not in the docker group. The service gets it through SupplementaryGroups, but"
@@ -142,6 +166,7 @@ fi
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 sed -e "s|@USER@|$(esc "$USER_NAME")|g" -e "s|@GROUP@|$(esc "$GROUP_NAME")|g" -e "s|@SUPPLEMENTARY_GROUPS@|$SUPP|" \
+    -e "s|@AFTER_DOCKER@|$AFTER_DOCKER|" \
     -e "s|@HOME@|$(esc "$HOME")|g" -e "s|@VENV@|$(esc "$VENV")|g" -e "s|@CONFIG@|$(esc "$CONFIG")|g" \
     "$REPO/deploy/spark-switchboard.service" >"$TMP/spark-switchboard.service"
 if ((DRY)); then
@@ -176,15 +201,18 @@ if ((!DRY)); then
     systemctl --no-pager --lines=0 status spark-switchboard | head -5 || true
 fi
 
-# The dashboard URL, from the config (hostname and admin_port). Without a configured hostname: the system hostname
-# plus .local (mDNS, as on DGX OS), as clients on the LAN usually reach a DGX Spark.
+# The dashboard URL, from the config (hostname and admin_port). A configured hostname is used as it is (it may be a
+# VPN name, where .local doesn't resolve). Without one: the system hostname plus .local (mDNS, as on DGX OS), as
+# clients on the LAN usually reach a DGX Spark.
 local_name() { local h; h=$(hostname); [[ "$h" == *.* ]] && echo "$h" || echo "$h.local"; }
 URL=""
 if [[ -x "$VENV/bin/python" ]]; then
-    URL=$("$VENV/bin/python" -c 'import socket, sys
+    URL=$("$VENV/bin/python" -c 'import sys, tomllib
 from spark_switchboard import config
 c = config.load(sys.argv[1])
-host = c.hostname if c.hostname != socket.gethostname() or "." in c.hostname else c.hostname + ".local"
+with open(sys.argv[1], "rb") as f:
+    configured = tomllib.load(f).get("hostname")
+host = c.hostname if configured or "." in c.hostname else c.hostname + ".local"
 print(f"http://{host}:{c.admin_port}/")' "$CONFIG" 2>/dev/null) || URL=""
 fi
 say "dashboard: ${URL:-http://$(local_name):8800/}"

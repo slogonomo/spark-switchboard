@@ -26,10 +26,12 @@ admin_port = 8800
 # pages. Empty = the system hostname.
 hostname = ""
 
-# GPU memory (GiB) kept free on top of each app's memory_gib: the desktop's own use of the GPU can grow.
+# GPU memory (GiB) kept free on top of each app's memory_gib: the desktop's own use of the GPU can grow. An app starts
+# when memory_gib + reserve_gib is free, so count memory_gib as its launcher's threshold minus this.
 reserve_gib = 1
 
-# Host RAM (GiB) kept free on top of each app's ram_gib, for the desktop and whatever the person runs.
+# Host RAM (GiB) kept free on top of each app's ram_gib, for the desktop and whatever the person runs. Likewise: ram_gib
+# + ram_reserve_gib = the launcher's RAM threshold.
 ram_reserve_gib = 8
 
 # Pause: kept in state_dir across restarts and reboots until `spark-switchboard resume` (pause_persists), and resumed
@@ -60,7 +62,7 @@ listen = 8188                            # public port; switchboard answers here
 upstream = "http://127.0.0.1:18188"      # where ComfyUI listens while switchboard runs it (env below)
 memory_gib = 20                          # GPU memory that must be free to start it
 max_gib = 31                             # it can fill the GPU while a workflow runs
-ram_gib = 16                             # host RAM that must be free to start it (COMFY_MIN_FREE_GIB below)
+ram_gib = 16                             # host RAM it needs to start (+ ram_reserve_gib 8 = COMFY_MIN_FREE_GIB below)
 ram_max_gib = 40                         # models it offloads to RAM
 keep_warm = false                        # nothing runs by default
 idle_grace_s = 300                       # a person looking at results between runs
@@ -71,7 +73,7 @@ pidfile = "~/.local/state/spark-switchboard/run/comfyui.pid"
 [service.comfyui.run]
 command = ["bash", "~/src/spark-switchboard/examples/launchers/comfyui.sh"]
 # On a discrete GPU the launcher's memory checks (COMFY_MIN_FREE_GIB, COMFY_MEM_FLOOR_GIB) are about host RAM.
-env = { COMFYUI_DIR = "~/ComfyUI", COMFY_PORT = "18188", COMFY_LISTEN = "127.0.0.1", COMFY_MIN_FREE_GIB = "16" }
+env = { COMFYUI_DIR = "~/ComfyUI", COMFY_PORT = "18188", COMFY_LISTEN = "127.0.0.1", COMFY_MIN_FREE_GIB = "24" }
 stop_timeout_s = 40
 
 [service.comfyui.ready]

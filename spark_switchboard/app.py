@@ -239,7 +239,7 @@ class Hub:
         action = request.path[len("/__switchboard"):].strip("/")
         if action in ("", "status"):
             if request.query.get("want") == "1":
-                self.scheduler.touch(svc)
+                self.scheduler.touch(svc, poll=True)
             if action == "" and request.method == "GET" and "text/html" in request.headers.get("Accept", ""):
                 return pages.service_page(self, svc, 200, request)
             return web.json_response(self.service_status(svc), headers={"Cache-Control": "no-store"})
@@ -310,7 +310,7 @@ class Hub:
     async def _api_service(self, request):
         svc = self._svc(request)
         if request.query.get("want") == "1":
-            self.scheduler.touch(svc)
+            self.scheduler.touch(svc, poll=True)
         return web.json_response(self.service_status(svc), headers={"Cache-Control": "no-store"})
 
     async def _api_log(self, request):

@@ -269,7 +269,8 @@ class Examples(unittest.TestCase):
             self.assertFalse(s.enabled, f"{s.name}: examples ship disabled")
             for k, v in s.env.items():
                 if k.endswith("_MIN_FREE_GIB"):
-                    self.assertEqual(float(v), s.memory_gib, f"{s.name}: {k} should match memory_gib")
+                    self.assertEqual(float(v), s.memory_gib + cfg.reserve_gib,
+                                     f"{s.name}: {k} should be memory_gib + reserve_gib")
             script = Path(s.command[-1]).name
             if (launchers / script).exists():
                 text = (launchers / script).read_text()
@@ -288,7 +289,8 @@ class Examples(unittest.TestCase):
         self.assertFalse(s.keep_warm)
         self.assertGreater(s.idle_stop_s, 0)
         self.assertGreater(s.ram_gib, 0)
-        self.assertEqual(float(s.env["COMFY_MIN_FREE_GIB"]), s.ram_gib, "the launcher's check is about host RAM here")
+        self.assertEqual(float(s.env["COMFY_MIN_FREE_GIB"]), s.ram_gib + cfg.ram_reserve_gib,
+                         "the launcher's check is about host RAM here, reserve included")
         self.assertEqual(s.pidfile, os.path.expanduser("~/.local/state/spark-switchboard/run/comfyui.pid"))
         self.assertTrue(s.command[-1].endswith("/examples/launchers/comfyui.sh"))
         self.assertIn("\nAPP=comfyui\n", (REPO / "examples" / "launchers" / "comfyui.sh").read_text())

@@ -177,9 +177,12 @@ def main(argv=None):
             return
         m = st["memory"]
         if m.get("kind") == "gpu":
-            print(f"{st['host']}: {m.get('available_gib')} of {m.get('total_gib')} GiB GPU memory free"
-                  f"{' (' + m['gpu'] + ')' if m.get('gpu') else ''}, {m['ram'].get('available_gib')} of "
-                  f"{m['ram'].get('total_gib')} GiB RAM free" + (f"; {m['error']}" if m.get("error") else ""))
+            gpu = (f"{m.get('available_gib')} of {m.get('total_gib')} GiB GPU memory free"
+                   f"{' (' + m['gpu'] + ')' if m.get('gpu') else ''}" if m.get("total_gib") else None)
+            ram = f"{m['ram'].get('available_gib')} of {m['ram'].get('total_gib')} GiB RAM free"
+            # Before nvidia-smi has answered once there are no GPU numbers yet, only the reason.
+            print(f"{st['host']}: " + (f"{gpu}, {ram}" if gpu else f"{ram}")
+                  + (f"; {m['error']}" if m.get("error") else ""))
         else:
             print(f"{st['host']}: {m.get('available_gib')} of {m.get('total_gib')} GiB free")
         if st.get("paused"):

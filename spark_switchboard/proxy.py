@@ -104,11 +104,16 @@ class Proxy:
             # Waiting on other services: don't hold a tab's background requests (they'd use up the browser's few
             # connections to this host, which the status page needs too).
             return svc.adapter.unavailable(request, svc, self.info(svc, kind))
+        w = sched.wants.get(svc.name)
         if await sched.wait_ready(svc, wait, interest=(kind == WAKE)) and svc.state == READY:
             try:
                 return await self.forward(request, svc, kind)
             except UpstreamDown:
                 pass
+        if w is not None and sched.abandoned(w):         # this was the last request waiting for it
+            info = self.info(svc, kind, gave_up=True)
+            sched.cancel(svc, "dropped: the request waiting for it gave up")
+            return svc.adapter.unavailable(request, svc, info)
         return svc.adapter.unavailable(request, svc, self.info(svc, kind))
 
     def hold_window(self, request, svc):
@@ -120,8 +125,9 @@ class Proxy:
                 pass
         return svc.cfg.hold_s
 
-    def info(self, svc, kind=None):
-        """What to tell a client that can't be served right now."""
+    def info(self, svc, kind=None, gave_up=False):
+        """What to tell a client that can't be served right now. gave_up: the want goes with this answer (nobody else
+        waits for it), so it won't start by itself."""
         sched = self.hub.scheduler
         host = self.hub.cfg.hostname
         w = sched.wants.get(svc.name)
@@ -151,11 +157,16 @@ class Proxy:
             code = "paused"
         elif w is not None and w.phase == "making_room":
             msg = f"{svc.title} is starting on {host} ({w.text}); ready in about {ago(eta)}."
+        elif w is not None and w.phase == "waiting" and gave_up:
+            msg = f"{svc.title} can't start on {host} yet ({w.text}); it won't start by itself, so try again later."
+            code = "waiting"
         elif w is not None and w.phase == "waiting":
             msg = f"{svc.title} will start on {host} once memory is free: {w.text}."
             code = "waiting"
         elif w is not None and w.phase == "no_room":
             msg = f"{svc.title} can't start on {host} right now: {w.text}."
+            if gave_up:
+                msg += " It won't start by itself; try again later."
             code = "no_memory"
         elif w is not None:
             msg = f"{svc.title} is starting on {host}; ready in about {ago(eta)}."

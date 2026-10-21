@@ -387,6 +387,54 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
         await self.until(lambda: "b" not in self.hub.scheduler.wants, timeout=6)
         self.assertEqual(self.s("a").state, "ready")
 
+    async def test_a_want_goes_with_the_last_request_that_gave_up(self):
+        # B waits for memory that A (in its quiet period) holds. Its only caller gives up: the want goes with that
+        # answer, so B doesn't start later for nobody (want_ttl_s is long here, so only the give-up drops it).
+        await self.start_hub(self.svc("a", mem=80, idle_grace_s=60), self.svc("b", mem=80), want_ttl_s=600)
+        await self.chat("a")
+        code, _, body = await self.chat("b", headers={"X-Switchboard-Wait": "1"})
+        self.assertEqual(code, 503)
+        err = json.loads(body)["error"]
+        self.assertEqual(err["code"], "waiting")
+        self.assertIn("won't start by itself", err["message"])
+        self.assertNotIn("b", self.hub.scheduler.wants)
+        # An answer given at once (Wait 0: nobody was held) leaves the want alone.
+        code, _, body = await self.chat("b", headers={"X-Switchboard-Wait": "0"})
+        self.assertEqual(code, 503)
+        self.assertIn("b", self.hub.scheduler.wants)
+        self.assertNotIn("won't start by itself", json.loads(body)["error"]["message"])
+
+    async def test_a_polled_want_stays_when_a_request_gives_up(self):
+        # A status page (?want=1 on the app's port) or a launcher (?want=1 on the admin API) still waits for it.
+        await self.start_hub(self.svc("a", mem=80, idle_grace_s=60), self.svc("b", mem=80), want_ttl_s=600)
+        await self.chat("a")
+        polls = (self.url("b", "/__switchboard/status?want=1"), f"http://127.0.0.1:{self.admin}/api/services/b?want=1")
+        for poll in polls:
+            self.hub.scheduler.cancel(self.s("b"))
+            self.assertEqual((await self.admin_post("/api/services/b/start"))[0], 200)
+            async with self.http.get(poll) as r:
+                self.assertEqual(r.status, 200)
+            code, _, body = await self.chat("b", headers={"X-Switchboard-Wait": "1"})
+            self.assertEqual(code, 503)
+            self.assertIn("will start", json.loads(body)["error"]["message"])
+            self.assertIn("b", self.hub.scheduler.wants, poll)
+        # Not while making room: the stops are under way, and dropping the want would start nothing in their place.
+        w = self.hub.scheduler.wants["b"]
+        w.polled_at, w.phase = 0.0, "making_room"
+        self.assertFalse(self.hub.scheduler.abandoned(w))
+        w.phase = "waiting"
+        self.assertTrue(self.hub.scheduler.abandoned(w))
+
+    async def test_no_memory_counts_the_reserve_in(self):
+        # The answer gives what must really be free (memory_gib + reserve_gib) and free memory as the machine shows it.
+        self.memdir.mkdir(parents=True, exist_ok=True)
+        (self.memdir / "other.gib").write_text("100")       # memory held outside switchboard: 21 of 121 GiB free
+        await self.start_hub(self.svc("big", mem=60), reserve_gib=2)
+        code, _, body = await self.chat("big", headers={"X-Switchboard-Wait": "1"})
+        self.assertEqual(code, 503)
+        self.assertIn("needs 62 GiB free (2 GiB of it kept in reserve); 21 GiB is free",
+                      json.loads(body)["error"]["message"])
+
     async def test_admin_stop_refuses_busy_services(self):
         await self.start_hub(self.svc("a"))
         await self.chat("a")

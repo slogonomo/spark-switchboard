@@ -10,6 +10,9 @@ A request (or a person, or the API) *wants* a service. Each tick the scheduler g
   no room   even stopping every other service wouldn't free enough -> wait, saying so
 
 A want lapses when nobody is waiting for it any more (no held request, no open status page) for want_ttl_s.
+It goes at once when the last request held for it gives up while it waits for memory (phase waiting or no_room),
+unless a status page or a launcher polled it (?want=1) within POLL_GRACE_S: a want nobody waits for would otherwise
+start the app later for nobody, e.g. when a game on a workstation exits.
 
 While switchboard is paused (Hub.pause) there are no wants and no keep-warm starts, and each service switchboard
 runs is stopped once it isn't working.
@@ -27,6 +30,7 @@ from .memory import amount
 from .service import FAILED, READY, STARTING, STOPPED, STOPPING, ago
 
 FITS, EVICT, BLOCKED, NO_ROOM = "fits", "evict", "blocked", "no_room"
+POLL_GRACE_S = 10           # a ?want=1 poll this recent keeps a want whose held requests gave up (pages poll every 2-3 s)
 
 
 class Want:
@@ -35,6 +39,7 @@ class Want:
         self.reason = reason
         self.force = force
         self.created = self.touched = time.time()
+        self.polled_at = 0.0           # last ?want=1 poll (status page, launcher): someone still waits for it
         self.phase = "queued"          # queued | making_room | waiting | no_room
         self.text = ""
         self.blockers = []             # [(service, reason, in_progress)]
@@ -62,6 +67,11 @@ class Plan:
 def needs(cfg, pool):
     """(GiB of `pool` a service needs free to start, the most of it the service grows to)."""
     return (cfg.ram_gib, cfg.ram_max_gib) if pool == "ram" else (cfg.memory_gib, cfg.max_gib)
+
+
+def reserve(cfg, pool):
+    """GiB of `pool` kept free on top of each service's need (reserve_gib, ram_reserve_gib)."""
+    return cfg.ram_reserve_gib if pool == "ram" else cfg.reserve_gib
 
 
 def fits(free, need):
@@ -106,10 +116,19 @@ class Scheduler:
         svc.notify()
         return w
 
-    def touch(self, svc):
+    def touch(self, svc, poll=False):
         w = self.wants.get(svc.name)
         if w is not None:
             w.touched = time.time()
+            if poll:
+                w.polled_at = w.touched
+
+    def abandoned(self, w):
+        """True when `w` should go now that a request held for it gave up: it still waits for memory, no other request
+        is held for it and no page or launcher polled it lately. Not while making room: the stops are under way and
+        dropping it then would start nothing in their place."""
+        return (self.wants.get(w.svc.name) is w and w.holders == 0 and w.phase in ("waiting", "no_room")
+                and time.time() - w.polled_at > POLL_GRACE_S)
 
     def cancel(self, svc, why="cancelled"):
         w = self.wants.pop(svc.name, None)
@@ -255,8 +274,7 @@ class Scheduler:
     async def plan(self, target, force=False, evict=True):
         await self.refresh_usage()
         cfg = self.hub.cfg
-        free = {p: gib - (cfg.ram_reserve_gib if p == "ram" else cfg.reserve_gib)
-                for p, gib in self.hub.memory.available().items()}
+        free = {p: gib - reserve(cfg, p) for p, gib in self.hub.memory.available().items()}
         others = [s for s in self.services.values() if s is not target]
         for s in others:
             if s.state in (STARTING, READY):
@@ -307,8 +325,12 @@ class Scheduler:
             names = "; ".join(f"{s.title}: {why}" for s, why, _ in blocked)
             return Plan(BLOCKED, free, need, blockers=blocked, text=f"waiting for memory in use ({names})")
         external = [s.title for s in others if s.state in (STARTING, READY) and s.external]
-        text = "; ".join(f"needs {amount(need[p], p)} free; {max(free[p], 0):.0f} GiB is free and stopping the "
-                         f"services switchboard runs would bring it to {after[p]:.0f} GiB"
+        # In the numbers a person sees (nvidia-smi, MemAvailable): the need includes the reserve, free doesn't
+        # subtract it.
+        text = "; ".join(f"needs {amount(need[p] + reserve(cfg, p), p)} free"
+                         + (f" ({reserve(cfg, p):g} GiB of it kept in reserve)" if reserve(cfg, p) else "")
+                         + f"; {max(free[p] + reserve(cfg, p), 0):.0f} GiB is free and stopping the services "
+                         f"switchboard runs would bring it to {after[p] + reserve(cfg, p):.0f} GiB"
                          for p in need if after[p] < need[p])
         if external:
             text += f" ({', '.join(external)} was not started by switchboard, so it isn't stopped)"

@@ -216,7 +216,11 @@ in 2.5 min, and with ComfyUI stopped, its 40 websocket reconnects in 75 s were a
 The dashboard lists, per app, the requests that counted as use.
 
 A want that nobody waits for any more lapses after `want_ttl_s` (90 s): no held request and no open status page. So a
-one-off request can't trigger a switch an hour later.
+one-off request can't trigger a switch an hour later. It goes at once when the last request held for it gives up
+while it waits for memory, unless a status page or a launcher polled it (`?want=1`) in the last 10 s; that answer
+says the app won't start by itself. So memory freed later (a game exiting on a workstation) doesn't start an app
+nobody waits for. A want stays while switchboard stops other apps to make room for it, and an answer given at once
+(`X-Switchboard-Wait: 0`, or a start that takes longer than the wait) leaves it alone.
 
 **Keep warm and idle stop.** A `keep_warm` app starts whenever it fits without stopping anything (and nothing else is
 wanted, starting or stopping, and switchboard isn't [paused](#dashboard-cli-and-admin-api)). An `idle_stop_s` app stops after that long unused and not busy, which lets the
@@ -229,7 +233,9 @@ failure, requests get that failure instead of starting it again.
 
 For each app the service file gives:
 
-- `memory_gib`: the free memory it needs to start. Use the same threshold its launcher checks.
+- `memory_gib`: the free memory it needs to start. Count it so that `memory_gib + reserve_gib` is the threshold its
+  launcher checks (with the default `reserve_gib = 0`, the same number), so switchboard and the launcher agree on
+  when it fits.
 - `max_gib`: the most it grows to while running.
 
 What each running app holds is **measured**: GPU allocations per process from `nvidia-smi`, plus the anonymous and
@@ -237,8 +243,9 @@ shared resident memory (RssAnon + RssShmem) of its launcher's process tree and o
 `containers`. File-backed pages are left out, because they are page cache.
 
 "Free" for planning is MemAvailable minus `reserve_gib`, minus the headroom other running apps may still grow into
-(`max_gib` minus what each holds now). An app starts when free ≥ its `memory_gib`. Stopping an app frees
-max(`max_gib`, what it holds).
+(`max_gib` minus what each holds now). An app starts when free ≥ its `memory_gib`, so with a reserve it needs
+`memory_gib + reserve_gib` actually free; the `no_memory` answers give that sum and the free memory as `nvidia-smi`
+or MemAvailable shows it. Stopping an app frees max(`max_gib`, what it holds).
 
 **The GB10 page-cache quirk.** The GPU driver takes its own buffers, such as a new CUDA context, from truly free pages
 (MemFree), and doesn't wait for the kernel to evict page cache. With the cache full, a start can fail with
@@ -279,7 +286,9 @@ memory) and 64 GB of RAM that someone also uses directly. What differs from a DG
   pool: `ram_gib` (free RAM it needs to start) and `ram_max_gib` (the most it grows to), for apps that offload
   weights to the CPU. Both default to 0, which leaves RAM out of that app's plan. An app starts when both pools have
   room; stopping idle apps makes room in whichever pool is short, and the answers name it ("needs 20 GiB of GPU
-  memory free"). `reserve_gib` is kept free in GPU memory (the desktop uses some), `ram_reserve_gib` in RAM.
+  memory free"). `reserve_gib` is kept free in GPU memory (the desktop uses some), `ram_reserve_gib` in RAM, on top
+  of each app's need: if a launcher refuses below 25 GiB of free GPU memory and 42 GiB of free RAM, set `memory_gib
+  = 24` and `ram_gib = 34` with reserves of 1 and 8, not the launcher's numbers plus the reserves.
 - **Measured the same way, counted apart.** An app's GPU allocations (on this GPU only) count as GPU memory, the
   resident memory of its processes and containers as RAM. Free GPU memory is the GPU's own figure, so whatever else
   runs on the desktop (a game, an app started by hand) counts too.
@@ -586,7 +595,8 @@ otherwise), `GET /__switchboard/status[?want=1]`, `POST /__switchboard/start[?fo
 
 - **Install or update:** `deploy/install.sh` (again after a `git pull`). It reinstalls the package into `.venv`,
   checks the config, renders `spark-switchboard.service` (`User` and `Group` are you; `SupplementaryGroups=docker`
-  only if that group exists) and restarts it.
+  only if a service names `containers` and that group exists, since docker access is root-equivalent) and restarts
+  it.
 - **Restarts and upgrades don't stop the apps.** Launchers are started outside asyncio's process handling and the
   unit uses `KillMode=process`, so they outlive switchboard, and the new process re-adopts them through their
   pidfiles, keeping their uptime and use history.
@@ -688,15 +698,16 @@ python3 -m venv .venv && .venv/bin/pip install -e .
 .venv/bin/python -m unittest -v
 ```
 
-60 tests, about 2.5 min, no GPU and no docker. They start real processes on random localhost ports:
+63 tests, about 2.5 min, no GPU and no docker. They start real processes on random localhost ports:
 
-- `tests/test_switchboard.py` (29): a real switchboard in front of fake services (`tests/fake_service.py`) with fake
+- `tests/test_switchboard.py` (32): a real switchboard in front of fake services (`tests/fake_service.py`) with fake
   memory: holding and streaming, the status page, the tab rule, switching, quiet periods and force, never
   interrupting work, failed starts, websockets (6 MB frames), large uploads, HEAD, re-adoption across a real process
-  restart, keep-warm with idle stop, wants lapsing, admin stop, busy state that clears when work ends,
+  restart, keep-warm with idle stop, wants lapsing (and going with the last request that gave up, unless a page
+  or launcher still polls them), admin stop, busy state that clears when work ends,
   stop-if-unused, pause (keep-warm stays down, requests start nothing, work finishes first, resume, the CLI), a pause
   that persists across restarts, resuming only from the machine itself (`remote_resume = false`), a fake discrete GPU
-  (GPU memory and RAM planned apart, the answer naming the pool that is short), and a launcher started outside
+  (GPU memory and RAM planned apart, the answer naming the pool that is short, reserve included), and a launcher started outside
   switchboard that is never stopped.
 - `tests/test_launcher.py` (7): switchboard running `examples/launchers/example-app.sh`: started by a request, STATUS
   lines on the status page, the pidfile, surviving a switchboard exit, re-adoption by a new switchboard, SIGTERM

@@ -121,6 +121,7 @@ async function pause() {
 async function resume() { await postApi('/api/resume?reason=dashboard'); poll(); }
 
 function memBar(st, label, m, usage) {
+  if (!m.total_gib) return '';      // GPU memory not read yet: the warning below says so
   const total = m.total_gib || 1, avail = m.available_gib || 0;
   let used = 0, bar = '', legend = label ? `<span><b>${esc(label)}</b></span>` : '';
   st.services.forEach((s, i) => {

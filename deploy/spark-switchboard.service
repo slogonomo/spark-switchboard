@@ -1,7 +1,7 @@
 # /etc/systemd/system/spark-switchboard.service, rendered and installed by deploy/install.sh.
 [Unit]
 Description=spark-switchboard: on-demand front door for the model services on this machine
-After=network-online.target docker.service
+After=network-online.target@AFTER_DOCKER@
 Wants=network-online.target
 
 [Service]
