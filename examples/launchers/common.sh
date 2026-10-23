@@ -185,7 +185,8 @@ wait_http() {   # url [timeout_s=300] [pid]: until the URL answers 2xx; gives up
 }
 
 # ---- memory -----------------------------------------------------------------------------------------------------
-# On a DGX Spark (GB10) the CPU and GPU share one pool: MemAvailable is what an app can still get.
+# On a DGX Spark (GB10) the CPU and GPU share one pool: MemAvailable is what an app can still get. On a machine with a
+# discrete GPU it is host RAM only; switchboard ([memory] source = "gpu") plans the GPU's own memory.
 mem_gib() { awk -v k="${1:-MemAvailable}:" '$1 == k { printf "%d", $2 / 1048576 }' /proc/meminfo; }
 
 # A GiB setting as a whole number for bash arithmetic, rounded up (7.5 -> 8); returns 1 (printing nothing) when it

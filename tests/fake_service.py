@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """A stand-in for a real service's launcher, for tests: prints ">>> STATUS:" lines like a launcher does, waits
---start-delay seconds (loading), claims --mem GiB in the fake memory directory, then serves:
+--start-delay seconds (loading), claims --mem GiB (and --ram GiB of host RAM) in the fake memory directory, then
+serves:
 
   openai   GET /v1/models, /health; POST /v1/chat/completions (stream or not; "delay" in the body = seconds)
   comfy    GET /system_stats, /queue; POST /prompt (a job of "seconds" s, reported by /queue); /ws echo + status
@@ -24,6 +25,7 @@ ap.add_argument("--port", type=int, required=True)
 ap.add_argument("--kind", default="openai")
 ap.add_argument("--name", required=True)
 ap.add_argument("--mem", type=float, default=0)
+ap.add_argument("--ram", type=float, default=0)
 ap.add_argument("--mem-dir")
 ap.add_argument("--start-delay", type=float, default=0.5)
 ap.add_argument("--stop-delay", type=float, default=0.2)
@@ -36,9 +38,12 @@ def say(msg):
     print(f">>> STATUS: {msg}", flush=True)
 
 
-def claim(gib):
+def claim(share):
+    """Hold this share (0, 0.5 while loading, 1) of --mem, and of --ram if given."""
     if args.mem_dir:
-        Path(args.mem_dir, f"{args.name}.gib").write_text(str(gib))
+        Path(args.mem_dir, f"{args.name}.gib").write_text(str(args.mem * share))
+        if args.ram:
+            Path(args.mem_dir, f"{args.name}.ram.gib").write_text(str(args.ram * share))
 
 
 jobs = []          # comfy: [(prompt_id, end_time)]
@@ -121,7 +126,7 @@ async def main():
     loop = asyncio.get_running_loop()
     loop.add_signal_handler(signal.SIGTERM, stop.set)
     say(f"loading {args.name}")
-    claim(args.mem / 2)
+    claim(0.5)
     t0 = time.time()
     while time.time() - t0 < args.start_delay:
         if stop.is_set():
@@ -133,7 +138,7 @@ async def main():
             claim(0)
             return 1
         await asyncio.sleep(0.05)
-    claim(args.mem)
+    claim(1)
     app = web.Application(client_max_size=1 << 30)
     app.router.add_get("/health", reply({"ok": True}))
     app.router.add_get("/v1/models", models)

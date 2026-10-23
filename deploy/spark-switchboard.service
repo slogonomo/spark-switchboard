@@ -1,7 +1,7 @@
 # /etc/systemd/system/spark-switchboard.service, rendered and installed by deploy/install.sh.
 [Unit]
 Description=spark-switchboard: on-demand front door for the model services on this machine
-After=network-online.target docker.service
+After=network-online.target@AFTER_DOCKER@
 Wants=network-online.target
 
 [Service]
@@ -17,7 +17,8 @@ RestartSec=3
 # process re-adopts them through their pidfiles. Only the main process gets the stop signal. To stop everything:
 # `<repo>/.venv/bin/spark-switchboard pause` (stops the apps and keeps keep-warm apps from coming back), wait until
 # `spark-switchboard status` shows none running, then `systemctl stop spark-switchboard` (deploy/uninstall.sh does
-# all of this). A restart of switchboard is never paused.
+# all of this). A restart of switchboard resumes a pause, unless the pause persists (pause_persists in the config, or
+# `spark-switchboard pause --persist`): then it stays paused until `spark-switchboard resume`.
 KillMode=process
 TimeoutStopSec=15
 

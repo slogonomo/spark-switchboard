@@ -83,8 +83,10 @@ class ServiceConfig:
     command: list[str]                # the launcher; runs in the foreground until stopped (SIGTERM)
     env: dict[str, str] = field(default_factory=dict)
     cwd: str | None = None
-    memory_gib: float = 0             # free memory (MemAvailable) the service needs to start
+    memory_gib: float = 0             # free memory it needs to start (MemAvailable; GPU memory with source "gpu")
     max_gib: float = 0                # the most it grows to while running (default: memory_gib)
+    ram_gib: float = 0                # source "gpu" only: free host RAM it needs to start (CPU offload)
+    ram_max_gib: float = 0            # ... and the most host RAM it grows to (default: ram_gib)
     priority: int = 0                 # when memory is needed, lower priority services are stopped first
     idle_grace_s: float = 120         # not stopped for another service until unused this long (the minimum; see session_*)
     session_window_s: float = 900     # calls in this window before the last one decide whether a session is going on
@@ -118,8 +120,12 @@ class Config:
     state_dir: Path = Path("~/.local/state/spark-switchboard")
     hostname: str = ""                # "": socket.gethostname()
     reserve_gib: float = 0            # memory kept free on top of each service's own memory_gib
+    ram_reserve_gib: float = 0        # source "gpu" only: host RAM kept free on top of each service's ram_gib
     want_ttl_s: float = 90            # a start nobody waits for any more is dropped after this long
     use_event_after_s: float = 900    # the first use after this long unused goes in the event log (0: never)
+    pause_persists: bool = False      # a pause is kept in state_dir across restarts until resumed (the default for
+                                      # `pause`; `pause --persist` / `--no-persist` choose per pause)
+    remote_resume: bool = True        # False: only this machine itself may resume a pause
     memory: dict = field(default_factory=lambda: {"source": "system"})
     services: dict[str, ServiceConfig] = field(default_factory=dict)
 
@@ -128,7 +134,8 @@ MAIN_KEYS = set(Config.__dataclass_fields__) - {"path", "services"}
 SERVICE_KEYS = set(ServiceConfig.__dataclass_fields__) - {"name"}
 RUN_KEYS = {"command", "env", "cwd", "stop_timeout_s", "kill_command"}
 READY_KEYS = {"path": "ready_path", "estimate_s": "start_estimate_s", "timeout_s": "start_timeout_s"}
-MEMORY_KEYS = {"source", "free_floor_gib", "reclaim_command", "total_gib", "dir"}
+MEMORY_KEYS = {"source", "free_floor_gib", "reclaim_command", "gpu", "total_gib", "ram_total_gib", "dir"}
+MEMORY_SOURCES = ("system", "gpu", "fake")
 BUSY_PROBE_KEYS = {"path", "nonempty", "list", "field", "idle_values"}
 
 
@@ -138,15 +145,33 @@ def _table(value, where):
     return value
 
 
+def _check_bools(d, cls, origin):
+    """The keys that are bool fields of the dataclass `cls` must be true or false: TOML's "false" (quoted) is a string,
+    which Python takes as true (remote_resume = "false" would let any machine resume)."""
+    for k, f in cls.__dataclass_fields__.items():
+        if f.type is bool and k in d and not isinstance(d[k], bool):
+            raise ConfigError(f"{origin}: {k} must be true or false (unquoted), not {d[k]!r}")
+
+
 def _check_memory(m, origin):
     m = _table(m, f"{origin}: [memory]")
     if set(m) - MEMORY_KEYS:
         raise ConfigError(f"{origin}: unknown keys in [memory]: {sorted(set(m) - MEMORY_KEYS)}")
     source = m.get("source", "system")
-    if source not in ("system", "fake"):
-        raise ConfigError(f"{origin}: [memory] source must be \"system\" (or \"fake\" for the tests), not {source!r}")
+    if source not in MEMORY_SOURCES:
+        raise ConfigError(f"{origin}: [memory] source must be \"system\" (unified memory, as on a DGX Spark), \"gpu\" "
+                          f"(one discrete NVIDIA GPU) or \"fake\" (for the tests), not {source!r}")
     if source == "fake" and not {"total_gib", "dir"} <= set(m):
         raise ConfigError(f"{origin}: [memory] source = \"fake\" needs total_gib and dir")
+    if "gpu" in m and source != "gpu":
+        raise ConfigError(f"{origin}: [memory] gpu only applies with source = \"gpu\"")
+    if not isinstance(m.get("gpu", 0), (int, str)) or isinstance(m.get("gpu"), bool):
+        raise ConfigError(f"{origin}: [memory] gpu must be an nvidia-smi index (0) or a GPU UUID (\"GPU-...\")")
+
+
+def has_ram_pool(memory):
+    """Whether host RAM is planned separately from the main pool (a discrete GPU), so ram_gib etc. apply."""
+    return memory.get("source", "system") == "gpu" or (memory.get("source") == "fake" and "ram_total_gib" in memory)
 
 
 def _check_busy_probe(p, origin):
@@ -208,9 +233,12 @@ def _service(name, d, origin):
     if d.get("kill_command"):
         d["kill_command"] = [expand(c) for c in d["kill_command"]]
     d["upstream"] = d["upstream"].rstrip("/")
+    _check_bools(d, ServiceConfig, origin)
     s = ServiceConfig(name=name, **d)
     if not s.max_gib:
         s.max_gib = s.memory_gib
+    if not s.ram_max_gib:
+        s.ram_max_gib = s.ram_gib
     return s
 
 
@@ -225,6 +253,7 @@ def load(path):
     unknown = set(raw) - MAIN_KEYS
     if unknown:
         raise ConfigError(f"{path}: unknown keys {sorted(unknown)}")
+    _check_bools(raw, Config, path)
     cfg = Config(path=path, **raw)
     _check_memory(cfg.memory, path)
     cfg.state_dir = Path(expand(cfg.state_dir))
@@ -243,6 +272,14 @@ def load(path):
         _add(cfg, _service(name, d, f))
     for name, d in inline.items():
         _add(cfg, _service(name, d, path))
+    if not has_ram_pool(cfg.memory):
+        why = ("with [memory] source = \"gpu\" (a discrete GPU); on unified memory, memory_gib and max_gib cover "
+               "RAM too")
+        if cfg.ram_reserve_gib:
+            raise ConfigError(f"{path}: ram_reserve_gib only applies {why}")
+        for s in cfg.services.values():
+            if s.ram_gib or s.ram_max_gib:
+                raise ConfigError(f"service {s.name!r}: ram_gib and ram_max_gib only apply {why}")
     ports = {}
     for s in cfg.services.values():
         if not s.enabled:

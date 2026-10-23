@@ -1,0 +1,81 @@
+# spark-switchboard on a workstation with one discrete NVIDIA GPU (for example a desktop with one RTX 5090, 32 GB of
+# GPU memory and 64 GB of RAM) that a person also uses directly.
+#
+# Use it instead of examples/switchboard.toml (which describes a DGX Spark):
+#   mkdir -p ~/.config/spark-switchboard
+#   cp examples/workstation.toml ~/.config/spark-switchboard/switchboard.toml
+# then edit it, check it with `.venv/bin/spark-switchboard check` and install with deploy/install.sh (README,
+# "A workstation with one discrete GPU").
+#
+# What it sets up:
+# - Nothing runs by default: no keep_warm. An app starts when a program or a browser uses its port, and stops after
+#   idle_stop_s unused, so the GPU is free again for the person at the desk.
+# - Memory is counted as GPU memory (from nvidia-smi) plus host RAM (MemAvailable), not as unified memory.
+# - A pause (`spark-switchboard pause`) stops the apps and starts nothing until `spark-switchboard resume`, also
+#   across restarts and reboots (pause_persists), and only this machine itself can resume it (remote_resume).
+
+# Dashboard and admin API: http://<this machine>:8800/
+admin_port = 8800
+
+# Every interface by default. There is no authentication: reach it over a VPN or trusted LAN only, and keep the
+# ports closed to everything else (README, "Security"). bind = "<VPN address>" listens on that address only; the
+# CLI then talks to that address too.
+# bind = ""
+
+# The name other machines use to reach this one (a VPN or LAN name), used in messages to API clients and on the
+# pages. Empty = the system hostname.
+hostname = ""
+
+# GPU memory (GiB) kept free on top of each app's memory_gib: the desktop's own use of the GPU can grow. An app starts
+# when memory_gib + reserve_gib is free, so count memory_gib as its launcher's threshold minus this.
+reserve_gib = 1
+
+# Host RAM (GiB) kept free on top of each app's ram_gib, for the desktop and whatever the person runs. Likewise: ram_gib
+# + ram_reserve_gib = the launcher's RAM threshold.
+ram_reserve_gib = 8
+
+# Pause: kept in state_dir across restarts and reboots until `spark-switchboard resume` (pause_persists), and resumed
+# only from this machine itself: `spark-switchboard resume` on it, or the dashboard opened on it (remote_resume).
+# Callers on other machines get 503 with the code "paused", the reason and Retry-After while it is paused.
+pause_persists = true
+remote_resume = false
+
+want_ttl_s = 90
+use_event_after_s = 900
+
+[memory]
+# "gpu": one discrete NVIDIA GPU. An app's memory_gib and max_gib are GPU memory on this GPU (nvidia-smi index or
+# UUID); its ram_gib and ram_max_gib are host RAM. Usage is measured per app: GPU allocations per process (nvidia-smi)
+# and the resident memory of its processes and containers. The GB10 page-cache fix (free_floor_gib,
+# reclaim_command) is not needed on a discrete GPU.
+source = "gpu"
+gpu = 0
+
+# One app. More apps: more [service.NAME] tables, or include = ["services/*.toml"] with one file each (README,
+# "Configuration reference"). The numbers are starting points for a 32 GB GPU and 64 GB of RAM, not measurements:
+# watch the dashboard while the app works and adjust them.
+[service.comfyui]
+enabled = false                          # true once COMFYUI_DIR below points at your ComfyUI checkout
+title = "ComfyUI"
+adapter = "comfyui"                      # busy = anything in its queue (GET /queue)
+listen = 8188                            # public port; switchboard answers here
+upstream = "http://127.0.0.1:18188"      # where ComfyUI listens while switchboard runs it (env below)
+memory_gib = 20                          # GPU memory it needs to start (+ reserve_gib 1 = what must be free)
+max_gib = 31                             # it can fill the GPU while a workflow runs
+ram_gib = 16                             # host RAM it needs to start (+ ram_reserve_gib 8 = COMFY_MIN_FREE_GIB below)
+ram_max_gib = 40                         # models it offloads to RAM
+keep_warm = false                        # nothing runs by default
+idle_grace_s = 300                       # a person looking at results between runs
+idle_stop_s = 900                        # stop after 15 min unused, which gives the GPU back
+hold_s = 120
+pidfile = "~/.local/state/spark-switchboard/run/comfyui.pid"
+
+[service.comfyui.run]
+command = ["bash", "~/src/spark-switchboard/examples/launchers/comfyui.sh"]
+# On a discrete GPU the launcher's memory checks (COMFY_MIN_FREE_GIB, COMFY_MEM_FLOOR_GIB) are about host RAM.
+env = { COMFYUI_DIR = "~/ComfyUI", COMFY_PORT = "18188", COMFY_LISTEN = "127.0.0.1", COMFY_MIN_FREE_GIB = "24" }
+stop_timeout_s = 40
+
+[service.comfyui.ready]
+path = "/system_stats"
+estimate_s = 15

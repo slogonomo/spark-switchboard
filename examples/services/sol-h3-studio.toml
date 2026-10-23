@@ -1,3 +1,7 @@
+# DEPRECATED: the studio is LF Studio since its 0.5; use lf-studio.toml next to this file. This file, for the old
+# names (repository sol-h3-studio, bin/sol-h3-studio, SOLH3_* settings), goes in the next release. Enabling both
+# claims port 8190 twice, which switchboard refuses; install.sh doesn't copy this one into a new config.
+#
 # Sol-H3 Studio: a web studio for NVIDIA Research's Sol-H3-Spark video and audio pipeline on one DGX Spark, from the
 # companion repository https://github.com/slogonomo/sol-h3-studio. The pipeline runs MiniMax H3 and Lightricks
 # LTX-2.5 models; their weights are downloaded separately, under their own licenses (see that repository's README,

@@ -3,7 +3,8 @@
 #
 #   deploy/uninstall.sh [--kill | --keep-apps] [--dry-run]
 #
-#   default      Pause switchboard (.venv/bin/spark-switchboard pause): it stops every app it runs and starts nothing
+#   default      Pause switchboard (.venv/bin/spark-switchboard pause --no-persist: this pause isn't kept for a later
+#                reinstall; a pause that already persists stays): it stops every app it runs and starts nothing
 #                any more, not even keep-warm apps. Work in progress is not interrupted: an app that is working is
 #                stopped when that work is done. Wait (up to 10 min) until `spark-switchboard status --json` shows none
 #                of them starting, running or stopping, then disable and remove the unit and the optional sudoers
@@ -65,7 +66,11 @@ if [[ -x "$SB" ]] && systemctl is-active --quiet spark-switchboard; then
     if ((KEEP)); then
         say "leaving these apps running: $(running_apps)"
     else
-        if ! run "$SB" pause "${KILL[@]}" "${CFG[@]}"; then
+        PAUSE=(pause --no-persist --reason uninstall)
+        # .venv installed from an older checkout (a `git pull` without rerunning install.sh): its pause has neither
+        # flag, and never persists.
+        [[ "$("$SB" pause --help 2>/dev/null)" == *--no-persist* ]] || PAUSE=(pause)
+        if ! run "$SB" "${PAUSE[@]}" "${KILL[@]}" "${CFG[@]}"; then
             say "could not pause spark-switchboard; nothing was removed (--keep-apps removes it anyway)"
             exit 1
         fi

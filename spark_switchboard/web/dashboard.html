@@ -35,6 +35,7 @@ a { color: var(--accent); }
 .membar > div { height: 100%; }
 .memlegend { display: flex; gap: 14px; flex-wrap: wrap; color: var(--muted); font-size: 12.5px; margin-top: 4px; }
 .memlegend i { display: inline-block; width: 9px; height: 9px; border-radius: 2px; margin-right: 4px; vertical-align: -1px; }
+.memlegend + .membar { margin-top: 10px; }
 .cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 12px; margin-top: 18px; }
 .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
 .card h2 { font-size: 16px; margin: 0; display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
@@ -73,10 +74,7 @@ ul.uses { margin: 4px 0 0; padding-left: 18px; font-size: 12.5px; color: var(--m
     <span><b>Paused</b> <span id="paused-text"></span></span>
     <button id="btn-resume" class="primary">Resume</button>
   </div>
-  <section class="mem">
-    <div class="membar" id="membar"></div>
-    <div class="memlegend" id="memlegend"></div>
-  </section>
+  <section class="mem" id="mem"></section>
   <section class="cards" id="cards"></section>
   <section class="events"><h3>Recent events</h3><p class="sub evsub">Starts, stops and switches<span id="evuse"></span>. Each app's recent requests are under "what counted as use".</p><ol id="events"></ol></section>
 </main>
@@ -114,7 +112,8 @@ async function postApi(path) {
 }
 async function act(name, action, extra = '') { await postApi(`/api/services/${name}/${action}${extra}`); poll(); }
 async function pause() {
-  if (!confirm('Pause switchboard?\n\nIt stops every app it runs and starts nothing (no keep-warm, no starts on request) until you resume. Work in progress finishes first.')) return;
+  if (!confirm('Pause switchboard?\n\nIt stops every app it runs and starts nothing (no keep-warm, no starts on request) until you resume'
+    + (SB.pause_persists ? ', also across restarts and reboots' : '') + '. Work in progress finishes first.')) return;
   const j = await postApi('/api/pause?reason=dashboard');
   const busy = Object.entries(j.services || {}).filter(([n, w]) => w.startsWith('busy')).map(([n, w]) => n + ': ' + w);
   if (busy.length) toast(busy.join('; '));
@@ -122,26 +121,39 @@ async function pause() {
 }
 async function resume() { await postApi('/api/resume?reason=dashboard'); poll(); }
 
-function render(st) {
-  $('h').textContent = 'switchboard · ' + st.host;
-  const paused = st.paused;
-  $('paused').classList.toggle('hidden', !paused);
-  $('btn-pause').classList.toggle('hidden', !!paused);
-  if (paused) $('paused-text').textContent = 'for ' + ago(st.time - paused.since) + ' (' + paused.reason + '): nothing starts, and each app switchboard runs is stopped once its work is done. A restart of switchboard also resumes.';
-  const total = st.memory.total_gib || 1, avail = st.memory.available_gib || 0;
-  let used = 0, bar = '', legend = '';
+function memBar(st, label, m, usage) {
+  if (!m.total_gib) return '';      // GPU memory not read yet: the warning below says so
+  const total = m.total_gib || 1, avail = m.available_gib || 0;
+  let used = 0, bar = '', legend = label ? `<span><b>${esc(label)}</b></span>` : '';
   st.services.forEach((s, i) => {
-    if (s.usage_gib > 0.2) {
-      used += s.usage_gib;
-      bar += `<div title="${esc(s.title)} ${s.usage_gib} GiB" style="width:${100 * s.usage_gib / total}%;background:${COLORS[i % COLORS.length]}"></div>`;
-      legend += `<span><i style="background:${COLORS[i % COLORS.length]}"></i>${esc(s.title)} ${s.usage_gib.toFixed(0)} GiB</span>`;
+    const u = usage(s);
+    if (u > 0.2) {
+      used += u;
+      bar += `<div title="${esc(s.title)} ${u} GiB" style="width:${100 * u / total}%;background:${COLORS[i % COLORS.length]}"></div>`;
+      legend += `<span><i style="background:${COLORS[i % COLORS.length]}"></i>${esc(s.title)} ${u.toFixed(0)} GiB</span>`;
     }
   });
   const other = Math.max(0, total - avail - used);
   bar += `<div title="other" style="width:${100 * other / total}%;background:var(--idle)"></div>`;
   legend += `<span><i style="background:var(--idle)"></i>other ${other.toFixed(0)} GiB</span><span>free ${avail.toFixed(0)} of ${total.toFixed(0)} GiB</span>`;
-  $('membar').innerHTML = bar;
-  $('memlegend').innerHTML = legend;
+  return `<div class="membar">${bar}</div><div class="memlegend">${legend}</div>`;
+}
+
+function render(st) {
+  $('h').textContent = 'switchboard · ' + st.host;
+  const paused = st.paused;
+  $('paused').classList.toggle('hidden', !paused);
+  // A viewer who can't resume (remote_resume = false, on another machine) gets no Pause either: it couldn't undo it.
+  $('btn-pause').classList.toggle('hidden', !!paused || !SB.can_resume);
+  if (paused) $('paused-text').textContent = 'for ' + ago(st.time - paused.since) + ' (' + paused.reason + '): nothing starts, and each app switchboard runs is stopped once its work is done. '
+    + (paused.persists ? 'It stays paused across restarts and reboots until resumed.' : 'A restart of switchboard also resumes.')
+    + (SB.can_resume ? '' : ' Only ' + st.host + ' itself can resume it.');
+  $('btn-resume').classList.toggle('hidden', !SB.can_resume);
+  // One bar per memory pool: unified memory (DGX Spark), or GPU memory and host RAM (a discrete GPU).
+  const gpu = st.memory.kind === 'gpu';
+  $('mem').innerHTML = memBar(st, gpu ? 'GPU' + (st.memory.gpu ? ' (' + st.memory.gpu + ')' : '') : '', st.memory, s => s.usage_gib)
+    + (gpu ? memBar(st, 'RAM', st.memory.ram || {}, s => s.ram_usage_gib || 0) : '')
+    + (gpu && st.memory.error ? `<div class="memlegend warn">${esc(st.memory.error)}</div>` : '');
 
   const now = st.time;
   $('cards').innerHTML = st.services.map(s => {
@@ -150,7 +162,8 @@ function render(st) {
     const href = port ? `${location.protocol}//${location.hostname}:${port}/` : null;
     const lines = [];
     if (s.state === 'ready') {
-      lines.push(`<div class="kv">up ${ago(now - (s.ready_at || s.since))} · holds <b>${s.usage_gib} GiB</b> · ${s.inflight} in flight · ${s.websockets} open tab${s.websockets === 1 ? '' : 's'}</div>`);
+      const holds = 'ram_usage_gib' in s ? `<b>${s.usage_gib} GiB GPU</b> + ${s.ram_usage_gib} GiB RAM` : `<b>${s.usage_gib} GiB</b>`;
+      lines.push(`<div class="kv">up ${ago(now - (s.ready_at || s.since))} · holds ${holds} · ${s.inflight} in flight · ${s.websockets} open tab${s.websockets === 1 ? '' : 's'}</div>`);
       lines.push(`<div class="kv">last used ${s.last_activity ? ago(now - s.last_activity) + ' ago' : 'not since start'} · ${s.calls_10min} use${s.calls_10min === 1 ? '' : 's'} in 10 min</div>`);
       if (s.busy) lines.push(`<div class="warn">working: ${esc(s.busy)}</div>`);
       else if (s.quiet) lines.push(`<div class="kv">${esc(s.quiet.replace(/^last used [^;]+; /, ''))}</div>`);
@@ -160,7 +173,8 @@ function render(st) {
     } else if (s.state === 'stopping') {
       lines.push(`<div class="kv">${esc(s.stop_reason || '')}</div>`);
     } else {
-      lines.push(`<div class="kv">needs ${s.memory_gib} GiB free · starts in ~${ago(s.start_estimate_s)}${s.keep_warm ? ' · kept warm' : ''}${s.idle_stop_s ? ' · stops after ' + ago(s.idle_stop_s) + ' unused' : ''}</div>`);
+      const needs = 'ram_gib' in s ? `${s.memory_gib} GiB GPU${s.ram_gib ? ' + ' + s.ram_gib + ' GiB RAM' : ''}` : `${s.memory_gib} GiB`;
+      lines.push(`<div class="kv">needs ${needs} free · starts in ~${ago(s.start_estimate_s)}${s.keep_warm ? ' · kept warm' : ''}${s.idle_stop_s ? ' · stops after ' + ago(s.idle_stop_s) + ' unused' : ''}</div>`);
       if (s.stop_reason) lines.push(`<div class="kv">last stop: ${esc(s.stop_reason)}</div>`);
       if (s.warm_note) lines.push(`<div class="warn">${esc(s.warm_note)}</div>`);
     }
