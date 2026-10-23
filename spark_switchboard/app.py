@@ -255,7 +255,7 @@ class Hub:
                                  status=409)
 
     def may_resume(self, request):
-        """Whether this client may resume a pause: anyone, unless remote_resume = false (this machine only)."""
+        """Whether this client may resume (and so pause): anyone, unless remote_resume = false (this machine only)."""
         return self.cfg.remote_resume or (request is not None and self._local(request))
 
     def _resume_refused(self):
@@ -323,6 +323,10 @@ class Hub:
 
     async def _api_pause(self, request):
         self._guard(request)
+        if not self.may_resume(request):                  # it couldn't undo the pause
+            return web.json_response({"ok": False, "paused": self.paused_status(),
+                                      "error": f"pause is only accepted on {self.cfg.hostname} itself "
+                                               "(remote_resume = false): `spark-switchboard pause` there"}, status=403)
         kill = request.query.get("kill") == "1"
         if kill and not self._local(request):
             return web.json_response({"ok": False, "error": "kill=1 is only accepted on the machine itself "

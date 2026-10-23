@@ -313,9 +313,9 @@ inline (ComfyUI through `examples/launchers/comfyui.sh`; any launcher works the 
 - **Nothing runs by default:** no `keep_warm`. The app starts when a program or a browser uses its port, and
   `idle_stop_s` stops it after 15 min unused, which gives the GPU back.
 - **`pause_persists = true`:** a pause stays across restarts and reboots until `spark-switchboard resume`.
-- **`remote_resume = false`:** only the machine itself resumes a pause (`spark-switchboard resume` on it, or the
-  dashboard opened on it). Other machines get 403 for a resume, the answers they get while it is paused tell them to
-  try again later instead of how to resume, and their dashboard has no Pause button (they couldn't undo it).
+- **`remote_resume = false`:** only the machine itself pauses and resumes (`spark-switchboard pause` / `resume` on
+  it, or the dashboard opened on it). Other machines get 403 for a pause or a resume, the answers they get while it
+  is paused tell them to try again later instead of how to resume, and their dashboard has no Pause button.
 
 **Install** on a Linux machine with an NVIDIA GPU:
 
@@ -435,7 +435,7 @@ expanded in `state_dir`, `include` patterns, `command`, `env` values, `cwd`, `pi
 | `want_ttl_s` | `90` | a want nobody waits for any more lapses after this |
 | `use_event_after_s` | `900` | the first use of an app after this long unused goes to the event log; `0` = never |
 | `pause_persists` | `false` | `true`: a pause is kept in `state_dir` across restarts and reboots until resumed ([Pause](#dashboard-cli-and-admin-api)); `pause --persist` / `--no-persist` choose per pause |
-| `remote_resume` | `true` | `false`: only the machine itself may resume a pause; other machines get 403 |
+| `remote_resume` | `true` | `false`: only the machine itself may pause or resume; other machines get 403 |
 | `include` | `[]` | service file globs, relative to the main file |
 | `[memory] source` | `"system"` | `"system"`: unified memory, /proc/meminfo plus measured usage. `"gpu"`: one discrete NVIDIA GPU's memory from nvidia-smi, plus host RAM as a second pool ([workstation](#a-workstation-with-one-discrete-gpu)). (`"fake"`, with `total_gib`, `dir` and optionally `ram_total_gib`, is for the tests.) |
 | `[memory] gpu` | `0` | `source = "gpu"` only: the GPU, as its nvidia-smi index or UUID (`"GPU-..."`) |
@@ -556,9 +556,9 @@ is stopped as soon as that work is done (`--kill` interrupts it, from the machin
 didn't start are left alone. By default a pause is kept in memory only: restarting switchboard resumes it. A pause
 that **persists** (`pause_persists = true`, or `spark-switchboard pause --persist`) is kept in `state.json` and stays
 across restarts and reboots until `spark-switchboard resume`; pausing again without it doesn't undo that. With
-`remote_resume = false`, only the machine itself can resume (the CLI on it, or the dashboard opened on it); other
-machines get 403, no Resume button, and answers that say to try again later. Their dashboard shows no Pause button
-either, since they couldn't undo it; the admin API and the CLI (`--api`) still take a pause from them.
+`remote_resume = false`, only the machine itself can pause or resume (the CLI on it, or the dashboard opened on it):
+other machines couldn't undo a pause, so they get 403 for both, no Pause or Resume button, and answers that say to
+try again later.
 
 **CLI** (`.venv/bin/spark-switchboard`, or `python -m spark_switchboard`):
 
@@ -591,7 +591,7 @@ the config file found as above, else `http://127.0.0.1:8800`. Every command acce
 | `POST /api/services/NAME/start[?force=1&reason=TEXT]` | want it; `force=1` skips other apps' quiet periods |
 | `POST /api/services/NAME/stop[?kill=1&if_idle=1&reason=TEXT]` | stop it. 409 while busy unless `kill=1` (403 unless from this machine); with `if_idle=1`, 409 if it was used within its quiet period |
 | `POST /api/services/NAME/cancel` | drop its pending start |
-| `POST /api/pause[?kill=1&persist=1\|0&reason=TEXT]` | pause (see above); returns what happens to each app. `kill=1`: interrupt work too (403 unless from this machine). `persist`: keep it across restarts (default: `pause_persists`) |
+| `POST /api/pause[?kill=1&persist=1\|0&reason=TEXT]` | pause (see above); returns what happens to each app. `kill=1`: interrupt work too (403 unless from this machine). `persist`: keep it across restarts (default: `pause_persists`). 403 unless from this machine when `remote_resume = false` |
 | `POST /api/resume[?reason=TEXT]` | undo pause, a persisting one too (403 unless from this machine when `remote_resume = false`) |
 
 While paused, `POST .../start` answers 409 with `"paused": true`.
@@ -633,10 +633,9 @@ otherwise), `GET /__switchboard/status[?want=1]`, `POST /__switchboard/start[?fo
 - **No authentication**, like the apps themselves. By default switchboard listens on every interface: anyone who can
   reach the machine can use the apps, open the dashboard, read launcher logs, start, stop or cancel apps that are not
   busy, and pause or resume switchboard. Only `kill=1` (interrupting work) is limited to the machine itself, and
-  resuming a pause too when `remote_resume = false`. A pause still comes from anywhere then, and only the machine
-  itself can undo it (with `pause_persists`, also after a reboot); the dashboard offers Pause only to a viewer that
-  can resume. "The machine itself" is judged by the connecting address, so behind a reverse proxy on the same machine
-  (such as `tailscale serve`) every request counts as local: reach the ports directly instead.
+  pausing and resuming too when `remote_resume = false`. "The machine itself" is judged by the connecting address,
+  so behind a reverse proxy on the same machine (such as `tailscale serve`) every request counts as local: reach the
+  ports directly instead.
 - Use it on a **trusted LAN or VPN only**. Don't forward its ports to the internet. To keep it local, set
   `bind = "127.0.0.1"` and use SSH port forwarding (NVIDIA Sync does this); note that docker containers then can't
   reach the apps through `host.docker.internal`.
