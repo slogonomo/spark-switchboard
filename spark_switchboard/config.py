@@ -125,7 +125,7 @@ class Config:
     use_event_after_s: float = 900    # the first use after this long unused goes in the event log (0: never)
     pause_persists: bool = False      # a pause is kept in state_dir across restarts until resumed (the default for
                                       # `pause`; `pause --persist` / `--no-persist` choose per pause)
-    remote_resume: bool = True        # False: only this machine itself may resume a pause
+    remote_resume: bool = True        # False: only this machine itself may pause or resume
     memory: dict = field(default_factory=lambda: {"source": "system"})
     services: dict[str, ServiceConfig] = field(default_factory=dict)
 

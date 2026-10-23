@@ -686,11 +686,32 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.hub.paused)
         await self.until(lambda: self.s("main").state == "ready")
 
-    async def test_only_this_machine_resumes_when_remote_resume_is_off(self):
+    async def test_another_machine_pauses_and_resumes_by_default(self):
+        await self.start_hub(self.svc("llm"))
+        self.hub._local = lambda request: False             # a caller on another machine
+        code, r = await self.admin_post("/api/pause?kill=1")
+        self.assertEqual(code, 403)
+        self.assertFalse(self.hub.paused)
+        code, r = await self.admin_post("/api/pause?reason=remote")
+        self.assertEqual(code, 200)
+        self.assertTrue(self.hub.paused)
+        code, r = await self.admin_post("/api/resume")
+        self.assertEqual((code, r["resumed"]), (200, True))
+
+    async def test_only_this_machine_pauses_or_resumes_when_remote_resume_is_off(self):
         await self.start_hub(self.svc("llm"), self.svc("app", kind="web"), remote_resume=False)
-        await self.admin_post("/api/pause?reason=in%20use%20at%20the%20desk")
-        # A caller on another machine (every test client is on 127.0.0.1, so the check is replaced)
+        # A caller on another machine (every test client is on 127.0.0.1, so the check is replaced): no pause, since
+        # it couldn't undo it
         self.hub._local = lambda request: False
+        code, r = await self.admin_post("/api/pause?reason=remote")
+        self.assertEqual((code, r["paused"]), (403, None))
+        self.assertIn("pause is only accepted on testbox itself (remote_resume = false)", r["error"])
+        self.assertFalse(self.hub.paused)
+        del self.hub._local                                 # this machine itself pauses
+        await self.admin_post("/api/pause?reason=in%20use%20at%20the%20desk")
+        self.hub._local = lambda request: False
+        code, r = await self.admin_post("/api/pause?reason=remote")         # nor pauses again
+        self.assertEqual((code, r["paused"]["reason"]), (403, "in use at the desk"))
         code, headers, body = await self.chat("llm")
         self.assertEqual(code, 503)
         err = json.loads(body)["error"]
