@@ -12,6 +12,7 @@
 #   COMFY_EXTRA_ARGS     (empty)     more main.py arguments, e.g. "--extra-model-paths-config /path/to/paths.yaml"
 #   COMFY_MIN_FREE_GIB   60          free memory (MemAvailable) needed to start
 #   COMFY_MEM_FLOOR_GIB  6           memory guard floor; 0 turns the guard off
+#   COMFY_STALL_S        600         how long a running ComfyUI may leave its health check unanswered (see health)
 # (On a machine with a discrete GPU, MemAvailable is host RAM: these two are about RAM there. switchboard's
 # [memory] source = "gpu" checks the GPU's own memory.)
 # plus the LAUNCHER_* and SWITCHBOARD_* settings described in common.sh. ComfyUI's own output goes to
@@ -61,7 +62,23 @@ guard_action() {   # interrupt the running job and ask ComfyUI to drop its model
     say_status "ComfyUI job interrupted: memory was nearly exhausted (see the launcher log)"
 }
 
-health() { curl -fsS -m 5 -o /dev/null "$URL/system_stats"; }
+# keepalive's health check. A large job can stall ComfyUI's HTTP side for tens of seconds at a time (4-5 MP video on
+# an RTX 5090: about once per sampling step), so while its process runs, an answer that times out fails the check only
+# after COMFY_STALL_S without one. A ComfyUI that exited, or answers with an error, fails it at once.
+STALL_SINCE=
+health() {
+    local rc=0 err
+    kill -0 "$PY_PID" 2>/dev/null || return 1
+    err=$(curl -fsS -m 5 -o /dev/null "$URL/system_stats" 2>&1) || rc=$?
+    if ((rc == 0)); then
+        [[ -z "$STALL_SINCE" ]] || log "ComfyUI answers again (no answer for $((SECONDS - STALL_SINCE)) s or more)"
+        STALL_SINCE=
+        return 0
+    fi
+    ((rc == 28)) || { echo "$err" >&2; return 1; }          # 28: timed out
+    [[ -n "$STALL_SINCE" ]] || { STALL_SINCE=$((SECONDS - 5)); log "ComfyUI does not answer within 5 s (busy?)"; }
+    ((SECONDS - STALL_SINCE < ${COMFY_STALL_S:-600}))
+}
 
 install_traps
 claim_pidfile

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import shutil
+import signal
 import socket
 import sys
 import tempfile
@@ -17,6 +18,7 @@ import aiohttp
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from spark_switchboard import config as config_mod  # noqa: E402
 from spark_switchboard import scheduler as scheduler_mod  # noqa: E402
+from spark_switchboard import service as service_mod  # noqa: E402
 from spark_switchboard.app import Hub  # noqa: E402
 
 FAKE = str(Path(__file__).with_name("fake_service.py"))
@@ -257,6 +259,48 @@ class SwitchboardTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("running", w.blockers[0][1])
         await self.until(lambda: self.s("b").state == "ready", timeout=15)
         self.assertEqual(self.s("comfy").state, "stopped")
+
+    async def prompt(self, name, seconds):
+        async with self.http.post(self.url(name, "/prompt"), json={"seconds": seconds}) as r:
+            self.assertEqual(r.status, 200)
+        return time.time() + seconds
+
+    async def test_idle_stop_counts_from_the_end_of_a_job(self):
+        # The job outlasts idle_stop_s after the request that queued it. It used to be stopped the moment it ended.
+        await self.start_hub(self.svc("comfy", kind="comfy", idle_stop_s=2))
+        end = await self.prompt("comfy", 5)
+        await asyncio.sleep(end + 1.5 - time.time())
+        self.assertEqual(self.s("comfy").state, "ready")
+        await self.until(lambda: self.s("comfy").state == "stopped", timeout=10)
+        self.assertIn("unused", self.s("comfy").stop_reason)
+
+    async def test_an_app_too_busy_to_answer_its_busy_probe_stays_busy(self):
+        await self.start_hub(self.svc("comfy", kind="comfy", idle_stop_s=1))
+        await self.prompt("comfy", 14)
+        await self.until(lambda: self.s("comfy").status()["busy"])
+        pid = int((self.tmp / "comfy.pid").read_text())
+        os.kill(pid, signal.SIGSTOP)            # a stalled server: connections are accepted, nothing answers
+        try:
+            await self.until(lambda: "no answer for" in (self.s("comfy").status()["busy"] or ""))
+            await asyncio.sleep(5)              # more probes time out
+            self.assertEqual(self.s("comfy").state, "ready")
+        finally:
+            os.kill(pid, signal.SIGCONT)
+        await self.until(lambda: self.s("comfy").state == "stopped", timeout=25)     # once the job is done
+        self.assertIn("unused", self.s("comfy").stop_reason)
+
+    async def test_a_hung_app_counts_as_busy_only_up_to_the_stall_limit(self):
+        await self.start_hub(self.svc("comfy", kind="comfy", idle_stop_s=1))
+        await self.prompt("comfy", 60)
+        await self.until(lambda: self.s("comfy").status()["busy"])
+        pid = int((self.tmp / "comfy.pid").read_text())
+        with mock.patch.object(service_mod, "PROBE_STALL_S", 6):
+            os.kill(pid, signal.SIGSTOP)
+            try:
+                await self.until(lambda: self.s("comfy").state != "ready", timeout=30)
+            finally:
+                os.kill(pid, signal.SIGCONT)
+        self.assertIn("unused", self.s("comfy").stop_reason)
 
     async def test_session_aware_quiet_period(self):
         await self.start_hub(self.svc("a", mem=10, idle_grace_s=5, session_grace_max_s=600))

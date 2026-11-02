@@ -22,7 +22,8 @@
 #   LAUNCHER_RUN_DIR      ~/.local/state/spark-switchboard/run        pidfiles and stop markers
 #   LAUNCHER_LOG_DIR      ~/.local/state/spark-switchboard/launchers  app server logs, and the launcher's own log
 #                                                                     when switchboard isn't the one running it
-#   LAUNCHER_POLL_S       5      keepalive interval in whole seconds (health checks run about every 30 s)
+#   LAUNCHER_POLL_S       5      keepalive interval in whole seconds
+#   LAUNCHER_HEALTH_S     30     seconds between keepalive's health checks (a whole number of LAUNCHER_POLL_S)
 #   LAUNCHER_STOP_WAIT_S  150    how long require_memory waits for another launcher that is still stopping
 #   SWITCHBOARD_API       http://127.0.0.1:8800   where the delegate looks for a running spark-switchboard
 #   SWITCHBOARD_SERVICE   $APP   the service name switchboard knows this app by
@@ -33,6 +34,7 @@ APP="${APP:?set APP before sourcing common.sh}"
 LAUNCHER_RUN_DIR="${LAUNCHER_RUN_DIR:-$HOME/.local/state/spark-switchboard/run}"
 LAUNCHER_LOG_DIR="${LAUNCHER_LOG_DIR:-$HOME/.local/state/spark-switchboard/launchers}"
 LAUNCHER_POLL_S="${LAUNCHER_POLL_S:-5}"
+LAUNCHER_HEALTH_S="${LAUNCHER_HEALTH_S:-30}"
 mkdir -p "$LAUNCHER_RUN_DIR" "$LAUNCHER_LOG_DIR"
 PIDFILE="$LAUNCHER_RUN_DIR/$APP.pid"
 APP_LOG="$LAUNCHER_LOG_DIR/$APP.log"
@@ -317,11 +319,11 @@ drop_caches() {
     fi
 }
 
-# Stay in the foreground until signalled. $1 (optional): a health function, run about every 30 s; after 4 failures
-# in a row the launcher exits 1 (and cleans up). Exits when re-parented only when not run by switchboard.
+# Stay in the foreground until signalled. $1 (optional): a health function, run every LAUNCHER_HEALTH_S (30 s); after
+# 4 failures in a row the launcher exits 1 (and cleans up). Exits when re-parented only when not run by switchboard.
 keepalive() {
     local health=${1:-} fails=0 n=0 every
-    every=$((30 / LAUNCHER_POLL_S))
+    every=$((LAUNCHER_HEALTH_S / LAUNCHER_POLL_S))
     ((every < 1)) && every=1
     while :; do
         nap "$LAUNCHER_POLL_S"

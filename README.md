@@ -199,8 +199,10 @@ A request for an app that doesn't fit becomes a *want*. The scheduler works thro
 An app counts as **in use** in two ways:
 
 - **Work in progress:** a request in flight, or a job its busy probe reports (ComfyUI's queue, a web app's job list).
-  This is **never interrupted**, not even by "Switch now". A switch waits for it to finish.
+  This is **never interrupted**, not even by "Switch now". A switch waits for it to finish. An app too busy to answer
+  its busy probe within 4 s (ComfyUI stalls like that during large jobs) keeps its last answer, for up to 10 min.
 - **The quiet period after use:** `idle_grace_s` after the last use (for example 2 min for an LLM, 5 min for ComfyUI).
+  Work counts as use, so the quiet period starts when a request or a job ends, not when the job was queued.
   If recent uses look like a **session** (3 or more separate uses within 15 min: `session_min_calls`,
   `session_window_s`), the quiet period stretches to 3 times the longest gap between them (`session_factor`), capped
   at 15 min (`session_grace_max_s`). So a person reading an answer before typing the next prompt, or an agent running
@@ -227,8 +229,9 @@ that (their memory can come back late), so those stops aren't for nothing. An an
 that couldn't have started the app (an open tab's background request, a `passive_paths` probe).
 
 **Keep warm and idle stop.** A `keep_warm` app starts whenever it fits without stopping anything (and nothing else is
-wanted, starting or stopping, and switchboard isn't [paused](#dashboard-cli-and-admin-api)). An `idle_stop_s` app stops after that long unused and not busy, which lets the
-keep-warm app come back. A keep-warm app whose start failed waits 10 min before the next try.
+wanted, starting or stopping, and switchboard isn't [paused](#dashboard-cli-and-admin-api)). An `idle_stop_s` app
+stops after that long unused and not busy (counted, like the quiet period, from the end of its last request or job),
+which lets the keep-warm app come back. A keep-warm app whose start failed waits 10 min before the next try.
 
 **Failed starts.** The status page shows why (from the launcher's output) with a Retry button. For 60 s after a
 failure, requests get that failure instead of starting it again.
@@ -395,8 +398,8 @@ switchboard runs the launcher with its own environment plus the service's `env`,
 
 Its settings (environment): `LAUNCHER_RUN_DIR` (default `~/.local/state/spark-switchboard/run`), `LAUNCHER_LOG_DIR`
 (`~/.local/state/spark-switchboard/launchers`; app server logs, and the launcher's own log when switchboard isn't
-running it), `LAUNCHER_POLL_S` (5), `LAUNCHER_STOP_WAIT_S` (150), and `SWITCHBOARD_API`, `SWITCHBOARD_SERVICE`,
-`SWITCHBOARD_DELEGATE` for the delegate.
+running it), `LAUNCHER_POLL_S` (5), `LAUNCHER_HEALTH_S` (30; seconds between keepalive's health checks),
+`LAUNCHER_STOP_WAIT_S` (150), and `SWITCHBOARD_API`, `SWITCHBOARD_SERVICE`, `SWITCHBOARD_DELEGATE` for the delegate.
 
 [`examples/launchers/example-app.sh`](examples/launchers/example-app.sh) is the smallest complete launcher (it serves
 a directory with `python3 -m http.server`). To start your own, copy it into `examples/launchers/` (next to
@@ -405,7 +408,7 @@ a directory with `python3 -m http.server`). To start your own, copy it into `exa
 | Launcher | Runs | Main settings |
 | --- | --- | --- |
 | `open-webui.sh` | Open WebUI in docker; recreates the container when its settings change (data volume kept). An existing container named `open-webui` is replaced on the first start: set `OWUI_DATA_VOLUME` (and `OWUI_IMAGE`, `OWUI_OLLAMA_DIR`) to match it first, or `OWUI_CONTAINER` to a new name | `OWUI_CONTAINER`, `OWUI_IMAGE`, `OWUI_PORT`, `OWUI_BIND`, `OWUI_DATA_VOLUME`, `OWUI_OPENAI_URLS`, `OWUI_OLLAMA_URL`, `OWUI_OLLAMA_DIR`, `OWUI_MIN_FREE_GIB` |
-| `comfyui.sh` | ComfyUI's `main.py` from a local checkout and venv; memory guard interrupts the job and unloads models; sets `TRITON_PTXAS_PATH` to CUDA 13's ptxas for sm_121 | `COMFYUI_DIR`, `COMFYUI_PYTHON`, `COMFY_PORT`, `COMFY_LISTEN`, `COMFY_EXTRA_ARGS`, `COMFY_MIN_FREE_GIB`, `COMFY_MEM_FLOOR_GIB` |
+| `comfyui.sh` | ComfyUI's `main.py` from a local checkout and venv; memory guard interrupts the job and unloads models; sets `TRITON_PTXAS_PATH` to CUDA 13's ptxas for sm_121 | `COMFYUI_DIR`, `COMFYUI_PYTHON`, `COMFY_PORT`, `COMFY_LISTEN`, `COMFY_EXTRA_ARGS`, `COMFY_MIN_FREE_GIB`, `COMFY_MEM_FLOOR_GIB`, `COMFY_STALL_S` |
 | `delegate.sh SERVICE` | nothing itself: asks a running switchboard to start SERVICE and follows it ([NVIDIA Sync](#nvidia-sync)) | `SWITCHBOARD_API` |
 | `tensorfold.sh` | MiaAI-Lab's TensorFold recipe through its own `start.sh` / `stop.sh`; optional checkpoint pre-read (load 93–98 s → 54–56 s, measured on a DGX Spark), page-cache drop when MemFree is low, fast stop while loading | `TF_RECIPE_DIR`, `TF_HOST`, `TF_PORT`, `TF_CONTAINER`, `TF_SERVED_NAME`, `TF_MIN_FREE_GIB`, `TF_PREREAD`, `TF_PREREAD_TABLE`, `TF_MIN_MEMFREE_GIB`, `TF_MEM_FLOOR_GIB` |
 
@@ -465,8 +468,8 @@ work in an inline `[service.NAME]` table (without `name`).
 | `ram_max_gib` | `ram_gib` | `source = "gpu"` only: the most host RAM it grows to |
 | `priority` | `0` | lower is stopped first when memory is needed; keep-warm apps start in descending order |
 | `keep_warm` | `false` | start whenever it fits without stopping anything |
-| `idle_grace_s` | `120` | quiet needed after use before another app may take its memory |
-| `idle_stop_s` | `0` | stop after this long unused (`0`: never) |
+| `idle_grace_s` | `120` | quiet needed after use (the end of the last request or job) before another app may take its memory |
+| `idle_stop_s` | `0` | stop after this long unused, from the end of the last request or job (`0`: never) |
 | `session_window_s` | `900` | uses in this window decide whether a session is going on |
 | `session_min_calls` | `3` | this many separate uses in the window make a session |
 | `session_burst_s` | `20` | uses closer together than this count as one |
@@ -502,6 +505,10 @@ list = "jobs"
 field = "status"
 idle_values = ["done", "failed", "cancelled"]
 ```
+
+A probe that doesn't answer within 4 s keeps its last answer for up to 10 min (`PROBE_STALL_S` in `service.py`): a
+server can be too busy to answer, and the limit keeps a hung one from blocking switches for ever. Other failures
+(refused, not 200, not JSON) count as not busy.
 
 A new protocol needs an adapter only if its clients need special answers: subclass `WebAdapter`
 (`spark_switchboard/adapters/base.py`), override `classify`, `synthetic`, `error_body` or `busy`, and register it in

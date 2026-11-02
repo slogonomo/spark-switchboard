@@ -394,7 +394,8 @@ class Scheduler:
             t = s.cfg.idle_stop_s
             if not t or s.state != READY or not s.can_stop() or s.name in self._stopping:
                 continue
-            if s.idle_for() < t or await s.busy_reason():
+            # Checked again after busy_reason: work that has just ended counts as use (it moves last_activity).
+            if s.idle_for() < t or await s.busy_reason() or s.idle_for() < t:
                 continue
             self.stop_in_background(s, f"unused for {ago(s.idle_for())}")
 

@@ -23,7 +23,13 @@ from pathlib import Path
 
 import aiohttp
 
+from .adapters.base import NO_ANSWER
+
 STOPPED, STARTING, READY, STOPPING, FAILED = "stopped", "starting", "ready", "stopping", "failed"
+# A busy probe that gets no answer keeps its last answer for up to this long. An app can be too busy to answer:
+# ComfyUI's HTTP side stalls for tens of seconds at a time during a large video job. The limit keeps a hung app from
+# blocking every switch for ever.
+PROBE_STALL_S = 600
 
 
 def ago(seconds):
@@ -54,11 +60,12 @@ class Service:
         self.log = deque(maxlen=300)
         self.inflight = 0              # proxied requests in progress that count as use
         self.websockets = 0
-        self.last_activity = 0.0
+        self.last_activity = 0.0        # the last use: a request that counts as use, or work (see busy_reason)
         self.calls = deque(maxlen=500)  # start times of requests that count as use
         self.recent_uses = deque(maxlen=20)  # (time, "POST /prompt from 192.0.2.10") - shown so it's clear what counted
         self.busy_text = None           # what busy_reason() last said
         self.busy_since = None
+        self._answer = None             # (time, reason) of the busy probe's last answer in this run
         self.started_at = None
         self.ready_at = None
         self.stopping_at = None
@@ -104,7 +111,7 @@ class Service:
     def _set(self, state, msg=None, level="info"):
         self.state = state
         self.since = time.time()
-        self.busy_text = self.busy_since = None
+        self.busy_text = self.busy_since = self._answer = None
         if msg:
             self.hub.event(self.name, msg, level)
         self.notify()
@@ -189,13 +196,23 @@ class Service:
 
     async def busy_reason(self):
         """Work in progress that switchboard never interrupts (not even when forced): requests in flight, or a job
-        the service reports (its busy probe)."""
+        the service reports (its busy probe). A probe that gets no answer keeps its last answer, for up to
+        PROBE_STALL_S. Work counts as use: while it lasts and when it ends, last_activity moves to now, so the quiet
+        period and idle_stop_s count from the end of the work, not from the request that queued it."""
         r = None
         if self.inflight > 0:
             r = f"{self.inflight} request{'s' if self.inflight > 1 else ''} in progress"
         elif self.state == READY:
             r = await self.adapter.busy(self, self.hub.session)
+            if r is NO_ANSWER:
+                t, last = self._answer or (0.0, None)
+                silent = time.time() - t
+                r = f"{last} (no answer for {ago(silent)})" if last and silent < PROBE_STALL_S else None
+            else:
+                self._answer = (time.time(), r)
         now = time.time()
+        if r is not None or self.busy_since is not None:
+            self.last_activity = now
         if r is None:
             self.busy_since = None
         elif self.busy_since is None:

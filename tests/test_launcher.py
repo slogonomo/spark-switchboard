@@ -441,6 +441,38 @@ class ComfyLauncherTest(unittest.TestCase):
         self.assertFalse(alive(int(s2)))
         self.assertEqual(self.server_pidfile(), [])
 
+    def stall(self, port, **env):
+        """A launcher checking health every second, whose ComfyUI is then stopped (SIGSTOP): a stalled server that
+        accepts connections and answers nothing. Returns the launcher, the server pid and a reader of its log."""
+        p = self.launch(COMFY_PORT=str(port), LAUNCHER_HEALTH_S="1", **env)
+        self.wait_for(lambda: listening(port) and len(self.server_pidfile()) == 3)
+        server = int(self.server_pidfile()[0])
+        self.pids.append(server)
+        time.sleep(2.5)                                       # healthy checks pass
+        os.kill(server, signal.SIGSTOP)
+        log = self.tmp / "logs" / "comfyui.log"
+        return p, server, lambda: log.read_text() if log.exists() else ""
+
+    def test_a_stalled_comfyui_is_not_given_up_on(self):
+        p, server, log = self.stall(free_port())
+        self.wait_for(lambda: "does not answer within 5 s" in log())
+        time.sleep(19)                  # 3 more checks time out: 4 in a row, the old limit, and none failed
+        self.assertNotIn("health check failed", log())
+        self.assertIsNone(p.poll())
+        os.kill(server, signal.SIGCONT)
+        self.wait_for(lambda: "answers again" in log())
+        self.assertNotIn("health check failed", log())
+        p.send_signal(signal.SIGTERM)
+        self.assertEqual(p.wait(30), 0)
+
+    def test_a_comfyui_stalled_past_comfy_stall_s_is_given_up_on(self):
+        p, server, log = self.stall(free_port(), COMFY_STALL_S="1")
+        self.wait_for(lambda: "is gone; exiting" in log(), timeout=60)
+        self.assertIn("health check failed (4/4)", log())
+        os.kill(server, signal.SIGCONT)                       # so it can take the launcher's SIGTERM
+        self.assertEqual(p.wait(30), 1)
+        self.wait_for(lambda: not alive(server))
+
     def test_a_refused_start_leaves_a_stale_pids_process_alone(self):
         victim = subprocess.Popen(["sleep", "300"], start_new_session=True)
         self.procs.append(victim)
