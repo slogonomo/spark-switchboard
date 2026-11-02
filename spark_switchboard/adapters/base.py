@@ -24,6 +24,7 @@ import aiohttp
 from aiohttp import web
 
 NAVIGATE, WAKE, TAB, PASSIVE = "navigate", "wake", "tab", "passive"
+NO_ANSWER = object()       # busy(): the probe got no answer in time (the service decides what that means)
 
 
 def is_websocket(request):
@@ -128,6 +129,9 @@ class WebAdapter:
           or
             path = "/api/state"
             list = "jobs"; field = "status"; idle_values = ["done", "failed", "cancelled"]    # busy if an item isn't
+
+        NO_ANSWER when the probe times out: an app can be too busy to answer (Service.busy_reason keeps the last
+        answer then). Other failures (refused, not 200, not JSON) mean not busy.
         """
         p = self.cfg.busy_probe
         if not p:
@@ -139,7 +143,10 @@ class WebAdapter:
         try:
             async with session.get(self.cfg.upstream + p["path"], timeout=aiohttp.ClientTimeout(total=4)) as r:
                 data = json.loads(await r.read()) if r.status == 200 else None
-        except (aiohttp.ClientError, TimeoutError, ValueError):
+        except TimeoutError:            # also aiohttp's ServerTimeoutError
+            self._probe_cache = (time.monotonic(), NO_ANSWER)
+            return NO_ANSWER
+        except (aiohttp.ClientError, ValueError):
             data = None
         if isinstance(data, dict):
             ne = p.get("nonempty")
